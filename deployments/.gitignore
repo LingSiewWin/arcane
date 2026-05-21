@@ -1,0 +1,6 @@
+# Deployment artifacts. Tracked addresses are safe-ish, but keep tx receipts
+# (which can include sender + signature data) and any *.private.* out of git.
+arc-testnet.broadcast.json
+*.private.json
+*.key
+*.secret
