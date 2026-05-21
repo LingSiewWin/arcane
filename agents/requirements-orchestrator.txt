@@ -1,0 +1,10 @@
+# Slice 5A - Orchestrator (Alice + Bob + demo glue).
+#
+# Inherits everything from requirements-memory.txt + requirements-darkpool.txt;
+# the only NEW dep is sentence-transformers for real text embeddings of Alice's
+# seeded corpus + Bob's market_state queries.
+
+-r requirements-memory.txt
+-r requirements-darkpool.txt
+
+sentence-transformers>=3.0,<6.0

@@ -1,0 +1,4 @@
+# Slice 1 - MemoryService dependencies (pinned for hackathon reproducibility)
+# Numpy is the only runtime dep; pytest is dev-only.
+numpy>=2.0,<3.0
+pytest>=8.0,<10.0
