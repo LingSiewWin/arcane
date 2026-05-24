@@ -8,6 +8,7 @@ import { ModeToggle } from "./mode-toggle";
 
 const NAV = [
   { href: "/arena", label: "arena" },
+  { href: "/colosseum", label: "colosseum" },
   { href: "/", label: "single run" },
 ] as const;
 
