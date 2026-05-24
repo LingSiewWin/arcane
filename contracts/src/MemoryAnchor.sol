@@ -34,6 +34,21 @@ contract MemoryAnchor {
         uint64 sequence;
     }
 
+    /// @notice An immutable, append-only history record. Once written it is
+    ///         never overwritten — a new anchor pushes a new record. This is
+    ///         the B13 fix: ERC-8004 identity NFTs are transferable, so the
+    ///         identity owner can change over time. Binding ``ownerAtAnchor``
+    ///         into each record means an off-chain observer reading the
+    ///         history can see *who* anchored each root, even after the
+    ///         identity has been transferred to a new owner. Old anchors stay
+    ///         visible with their original owner; the new owner can still
+    ///         append, but cannot rewrite or hide the past.
+    struct AnchorRecord {
+        bytes32 root;
+        address ownerAtAnchor;
+        uint256 timestamp;
+    }
+
     /// @notice ERC-8004 identity registry (ERC-721). Set at deploy time. On
     ///         Arc testnet this is 0x8004A818BFB912233c491871b3d84c89A494BD9e.
     address public immutable identityRegistry;
@@ -50,6 +65,15 @@ contract MemoryAnchor {
     /// @notice identityId => total anchors written
     mapping(uint256 => uint64) public countByIdentity;
 
+    // --- Append-only history (B13) --------------------------------------
+    /// @notice identityId => full, immutable, ordered list of every anchor
+    ///         ever made under that identity. Index == sequence (0-based).
+    ///         identityId == 0 holds the merged history of all legacy
+    ///         address-keyed anchors; those are UNVERIFIED (no ``ownerOf``
+    ///         check) and observers must treat ``ownerAtAnchor`` there as a
+    ///         self-asserted, sock-puppet-possible EOA.
+    mapping(uint256 => AnchorRecord[]) private _history;
+
     /// @notice Unified anchor event. ``identityId == 0`` means a legacy
     ///         address-keyed anchor; nonzero ``identityId`` means the anchor
     ///         is bound to an ERC-8004 identity owned by ``agent``.
@@ -62,6 +86,7 @@ contract MemoryAnchor {
 
     error EmptyRoot();
     error NotIdentityOwner();
+    error SequenceOutOfRange();
 
     constructor(address identityRegistry_) {
         identityRegistry = identityRegistry_;
@@ -91,6 +116,15 @@ contract MemoryAnchor {
             sequence: next
         });
         countByIdentity[identityId] = next;
+        // Append-only provenance record. msg.sender == the verified
+        // ownerOf(identityId) at this block, so it is the true owner-at-time.
+        _history[identityId].push(
+            AnchorRecord({
+                root: root,
+                ownerAtAnchor: msg.sender,
+                timestamp: block.timestamp
+            })
+        );
         emit MemoryAnchored(msg.sender, identityId, root, block.timestamp);
     }
 
@@ -113,6 +147,17 @@ contract MemoryAnchor {
             sequence: next
         });
         count[msg.sender] = next;
+        // Legacy anchors share a single identityId == 0 history. These are
+        // UNVERIFIED — there is no ownerOf check — so ownerAtAnchor here is a
+        // self-asserted EOA (sock-puppet-possible). Recorded for auditability
+        // anyway so the append-only invariant holds for every code path.
+        _history[0].push(
+            AnchorRecord({
+                root: root,
+                ownerAtAnchor: msg.sender,
+                timestamp: block.timestamp
+            })
+        );
         emit MemoryAnchored(msg.sender, 0, root, block.timestamp);
     }
 
@@ -137,5 +182,59 @@ contract MemoryAnchor {
     ///         identity.
     function rootOfIdentity(uint256 identityId) external view returns (bytes32) {
         return latestByIdentity[identityId].root;
+    }
+
+    // --------------------------------------------------------------------
+    // Append-only history views (B13)
+    // --------------------------------------------------------------------
+
+    /// @notice Number of anchors ever recorded for ``identityId`` (the length
+    ///         of its immutable history). Valid ``sequence`` values for the
+    ///         views below are ``0 .. historyLength - 1``.
+    function historyLength(uint256 identityId) external view returns (uint256) {
+        return _history[identityId].length;
+    }
+
+    /// @notice The full provenance of the anchor at position ``sequence`` for
+    ///         ``identityId``. Because the history is append-only, the record
+    ///         at any past ``sequence`` is immutable: it always reflects the
+    ///         root and the owner-at-the-time, even after the identity NFT has
+    ///         been transferred to a new owner.
+    /// @dev    Reverts ``SequenceOutOfRange`` if no such anchor exists.
+    function anchorAt(uint256 identityId, uint64 sequence)
+        external
+        view
+        returns (bytes32 root, address ownerAtAnchor, uint256 timestamp)
+    {
+        AnchorRecord[] storage h = _history[identityId];
+        if (sequence >= h.length) revert SequenceOutOfRange();
+        AnchorRecord storage rec = h[sequence];
+        return (rec.root, rec.ownerAtAnchor, rec.timestamp);
+    }
+
+    /// @notice The owner who made the anchor at ``sequence`` under
+    ///         ``identityId``. For identity-bound anchors this is the verified
+    ///         ``ownerOf(identityId)`` as of that block — so even after a
+    ///         transfer, history attributes each root to its real author.
+    /// @dev    Reverts ``SequenceOutOfRange`` if no such anchor exists.
+    function historicalOwnerOf(uint256 identityId, uint64 sequence)
+        external
+        view
+        returns (address)
+    {
+        AnchorRecord[] storage h = _history[identityId];
+        if (sequence >= h.length) revert SequenceOutOfRange();
+        return h[sequence].ownerAtAnchor;
+    }
+
+    /// @notice The most recent anchored root for ``identityId`` read straight
+    ///         from the append-only history (``bytes32(0)`` if none yet).
+    ///         Equivalent to ``rootOfIdentity`` but sourced from history, so
+    ///         observers can verify the two never diverge.
+    function latestRoot(uint256 identityId) external view returns (bytes32) {
+        AnchorRecord[] storage h = _history[identityId];
+        uint256 n = h.length;
+        if (n == 0) return bytes32(0);
+        return h[n - 1].root;
     }
 }

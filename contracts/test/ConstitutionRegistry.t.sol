@@ -13,13 +13,16 @@ contract ConstitutionRegistryTest is Test {
 
     function _twoRules() internal pure returns (ConstitutionRegistry.Rule[] memory rs) {
         rs = new ConstitutionRegistry.Rule[](2);
-        rs[0] = ConstitutionRegistry.Rule({kind: 0, params: abi.encode(uint256(20000))});
-        rs[1] = ConstitutionRegistry.Rule({kind: 1, params: abi.encode(uint256(1_000_000))});
+        // kind 0 (MAX_LEVERAGE) requires a non-zero adapter post-B16. The
+        // registry only stores the address (it never calls it), so a stub
+        // address is sufficient to exercise hashing / storage here.
+        rs[0] = ConstitutionRegistry.Rule({kind: 0, params: abi.encode(uint256(20000)), adapter: address(0xADA9)});
+        rs[1] = ConstitutionRegistry.Rule({kind: 1, params: abi.encode(uint256(1_000_000)), adapter: address(0)});
     }
 
     function _differentRules() internal pure returns (ConstitutionRegistry.Rule[] memory rs) {
         rs = new ConstitutionRegistry.Rule[](1);
-        rs[0] = ConstitutionRegistry.Rule({kind: 2, params: abi.encode(new address[](0))});
+        rs[0] = ConstitutionRegistry.Rule({kind: 2, params: abi.encode(new address[](0)), adapter: address(0)});
     }
 
     function test_define_stores_and_returns_rules() public {
@@ -61,5 +64,33 @@ contract ConstitutionRegistryTest is Test {
         bytes32 fake = bytes32(uint256(1));
         vm.expectRevert(abi.encodeWithSelector(ConstitutionRegistry.UnknownConstitution.selector, fake));
         registry.getConstitution(fake);
+    }
+
+    // -----------------------------------------------------------------------
+    // B16 — adapter-requiring rules must carry a non-zero adapter
+    // -----------------------------------------------------------------------
+
+    function test_define_constitution_rejects_max_leverage_without_adapter() public {
+        ConstitutionRegistry.Rule[] memory rs = new ConstitutionRegistry.Rule[](1);
+        rs[0] = ConstitutionRegistry.Rule({kind: 0, params: abi.encode(uint256(20000)), adapter: address(0)});
+        vm.expectRevert(abi.encodeWithSelector(ConstitutionRegistry.AdapterRequired.selector, uint8(0)));
+        registry.defineConstitution(rs);
+    }
+
+    function test_define_constitution_rejects_subdelegation_without_adapter() public {
+        ConstitutionRegistry.Rule[] memory rs = new ConstitutionRegistry.Rule[](1);
+        rs[0] = ConstitutionRegistry.Rule({kind: 4, params: abi.encode(uint256(500_000)), adapter: address(0)});
+        vm.expectRevert(abi.encodeWithSelector(ConstitutionRegistry.AdapterRequired.selector, uint8(4)));
+        registry.defineConstitution(rs);
+    }
+
+    function test_define_constitution_allows_max_trade_size_without_adapter() public {
+        // MAX_TRADE_SIZE (kind 1) has an inline fast path — adapter==0 is
+        // legitimate and MUST NOT be rejected (no false positive).
+        ConstitutionRegistry.Rule[] memory rs = new ConstitutionRegistry.Rule[](1);
+        rs[0] = ConstitutionRegistry.Rule({kind: 1, params: abi.encode(uint256(1_000_000)), adapter: address(0)});
+        bytes32 h = registry.defineConstitution(rs);
+        assertTrue(registry.exists(h));
+        assertEq(registry.ruleCount(h), 1);
     }
 }

@@ -21,6 +21,13 @@ contract MockERC721 {
         if (o == address(0)) revert NonexistentToken();
         return o;
     }
+
+    /// @dev Minimal ERC-721 transfer: reassign ownership. No approval logic —
+    ///      tests drive it directly to simulate an identity NFT changing hands.
+    function transferFrom(address from, address to, uint256 id) external {
+        require(_owners[id] == from, "wrong owner");
+        _owners[id] = to;
+    }
 }
 
 contract MemoryAnchorTest is Test {
@@ -195,6 +202,98 @@ contract MemoryAnchorTest is Test {
     }
 
     // ---------------------------------------------------------------
+    // B13: append-only history with owner-at-time provenance
+    // ---------------------------------------------------------------
+
+    function test_anchor_history_preserved_after_identity_transfer() public {
+        address alice = address(0xA11CE);
+        address bob = address(0xB0B);
+        bytes32 rootX = keccak256("alice-root-X");
+        bytes32 rootY = keccak256("bob-root-Y");
+
+        // Alice owns identity 42 and anchors X.
+        registry.mint(alice, ALICE_ID);
+        vm.prank(alice);
+        anchor.anchor(ALICE_ID, rootX);
+
+        // Identity 42 is transferred to Bob, who then anchors Y.
+        registry.transferFrom(alice, bob, ALICE_ID);
+        vm.prank(bob);
+        anchor.anchor(ALICE_ID, rootY);
+
+        // Both anchors remain visible in history with their correct
+        // owner-at-time. Alice's anchor is NOT overwritten by Bob's.
+        (bytes32 r0, address o0, ) = anchor.anchorAt(ALICE_ID, 0);
+        (bytes32 r1, address o1, ) = anchor.anchorAt(ALICE_ID, 1);
+        assertEq(r0, rootX);
+        assertEq(o0, alice);
+        assertEq(r1, rootY);
+        assertEq(o1, bob);
+
+        // History length is exactly 2 (append, not overwrite).
+        assertEq(anchor.historyLength(ALICE_ID), 2);
+        // Latest still resolves to Bob's most recent root.
+        assertEq(anchor.latestRoot(ALICE_ID), rootY);
+    }
+
+    function test_historical_owner_of_returns_correct_owner() public {
+        address alice = address(0xA11CE);
+        address bob = address(0xB0B);
+
+        registry.mint(alice, ALICE_ID);
+        vm.prank(alice);
+        anchor.anchor(ALICE_ID, keccak256("X"));
+
+        registry.transferFrom(alice, bob, ALICE_ID);
+        vm.prank(bob);
+        anchor.anchor(ALICE_ID, keccak256("Y"));
+
+        assertEq(anchor.historicalOwnerOf(ALICE_ID, 0), alice);
+        assertEq(anchor.historicalOwnerOf(ALICE_ID, 1), bob);
+    }
+
+    function test_anchor_at_out_of_range_reverts() public {
+        registry.mint(agent, ALICE_ID);
+        vm.prank(agent);
+        anchor.anchor(ALICE_ID, keccak256("only-one"));
+
+        // Sequence 1 does not exist yet (only sequence 0 was written).
+        vm.expectRevert(MemoryAnchor.SequenceOutOfRange.selector);
+        anchor.anchorAt(ALICE_ID, 1);
+
+        // historicalOwnerOf shares the same bound.
+        vm.expectRevert(MemoryAnchor.SequenceOutOfRange.selector);
+        anchor.historicalOwnerOf(ALICE_ID, 1);
+
+        // An identity with no anchors at all reverts at sequence 0.
+        vm.expectRevert(MemoryAnchor.SequenceOutOfRange.selector);
+        anchor.anchorAt(7777, 0);
+    }
+
+    function test_legacy_anchor_appends_to_identity_zero_history() public {
+        bytes32 root = keccak256("legacy-history");
+
+        vm.prank(agent);
+        anchor.anchorByAddress(root);
+
+        // Legacy anchor lands in the identityId == 0 history with the caller
+        // recorded as ownerAtAnchor (self-asserted / unverified).
+        assertEq(anchor.historyLength(0), 1);
+        (bytes32 r, address o, ) = anchor.anchorAt(0, 0);
+        assertEq(r, root);
+        assertEq(o, agent);
+        assertEq(anchor.historicalOwnerOf(0, 0), agent);
+
+        // A second legacy anchor from a different caller also appends.
+        address other = address(0xC0FFEE);
+        bytes32 root2 = keccak256("legacy-history-2");
+        vm.prank(other);
+        anchor.anchor(root2); // legacy selector
+        assertEq(anchor.historyLength(0), 2);
+        assertEq(anchor.historicalOwnerOf(0, 1), other);
+    }
+
+    // ---------------------------------------------------------------
     // Gas check (identity path)
     // ---------------------------------------------------------------
 
@@ -205,8 +304,15 @@ contract MemoryAnchorTest is Test {
         uint256 gasBefore = gasleft();
         anchor.anchor(ALICE_ID, r);
         uint256 gasUsed = gasBefore - gasleft();
-        // Identity-bound anchor: two SSTOREs + an event + one external
-        // ownerOf SLOAD. Loose sanity bound; still well under 100k.
-        assertLt(gasUsed, 100_000);
+        // Identity-bound anchor (B13 append-only history): the latest-slot
+        // SSTOREs + an event + one external ownerOf SLOAD, PLUS pushing an
+        // immutable AnchorRecord onto the per-identity history array. That
+        // push is the honest cost of full owner-at-time provenance — it
+        // initializes the array length slot and three fresh record slots
+        // (root, ownerAtAnchor, timestamp), the first anchor for an identity
+        // therefore pays several cold (20k) SSTOREs. Loose sanity bound that
+        // accounts for the provenance write; still well under the block gas
+        // limit and cheap enough to re-anchor every decay step.
+        assertLt(gasUsed, 200_000);
     }
 }
