@@ -8,3 +8,7 @@
 -r requirements-darkpool.txt
 
 sentence-transformers>=3.0,<6.0
+
+# Real LLM duelists (The Colosseum). The duel runner makes live model calls;
+# the key is read from $ANTHROPIC_API_KEY (never argv). Stubbed in unit tests.
+anthropic>=0.40,<1.0

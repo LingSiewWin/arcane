@@ -635,7 +635,7 @@ class MemoryService:
         ):
             raise ValueError(
                 f"malformed memory archive {path!r}: row-count mismatch "
-                f"(n={n}, vectors={vectors.shape[0]})"
+                f"(n={n}, bits_packed={bits_packed.shape[0]})"
             )
 
         # 4. Reconstruct.
