@@ -1,0 +1,55 @@
+{
+  "registry_addr": "0xf6a6e09118dCa5066D501110E05c8239688c72aD",
+  "constitution_registry": "0xF269c08e677a4A9CeB77760F87B9A6DDB4810FFe",
+  "bond_vault": "0x48690Ea0DDD9689d12C801adf984a3dBdFA186fD",
+  "identity_registry": "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+  "operator": "0x7119D50e51abFdd1e589a1185e8E55Edf7a90CeA",
+  "chain_id": 5042002,
+  "bond_usdc_each": 1.0,
+  "seeded_at": "2026-05-23T13:59:28Z",
+  "note": "All agents share one operator key for the demo; each is a distinct on-chain entity (own ERC-8004 identity + AgentRegistry agentId). One agent per identity (enforced on-chain).",
+  "agents": [
+    {
+      "agent_id": 1,
+      "identity_id": 19918,
+      "identity_tx": "0xd32aa3bc770b276e2dccc854dbc26c3d1523590ca6c0e7b83eb105ae36ca438c",
+      "approve_tx": "0xed0f8f3954c91acb90c22a979bfd534674ed774c18ec458a482c11cca4e3f49c",
+      "post_tx": "0x61b56a13416355e863b099f512745e2ab34ccdb4fa050a50248710b3bad1a032",
+      "define_tx": "0x9b6040467390716f69ab6e5376497f75a69bb52b73cb5e37b4aec67737377c2e",
+      "constitution_hash": "0xb98e634c1d5da2504f490f0ea7dbbf14efb5c1fb041ca2e6b0470d5b4bcc2baf",
+      "register_tx": "0xb993fc7db68cc7803cba38a5f308b571c0c7137185718243eeb99e233c4301eb",
+      "dark_pool_url": "http://localhost:8000/pool?agent=1",
+      "bond_amount_units": 1000000,
+      "operator": "0x7119D50e51abFdd1e589a1185e8E55Edf7a90CeA",
+      "explorer": "https://testnet.arcscan.app/tx/0xb993fc7db68cc7803cba38a5f308b571c0c7137185718243eeb99e233c4301eb"
+    },
+    {
+      "agent_id": 2,
+      "identity_id": 19920,
+      "identity_tx": "0x0afa8abd3317ac22098370f309074f2ccf54d05aedf40819381fcde9792af46e",
+      "approve_tx": "0x6f3a5267c6737b20f000ce32e12759e6eb2a8dc661c9ad96327967d07b42e4b6",
+      "post_tx": "0x96f716612498484b498e034ceaa6e6c984fc9795be5a0d5ba9d86def323f44c3",
+      "define_tx": "0x6b0a0b883044b6100bffd2d0013a9700af47dff0a4d10fe1f64a39d9f2d14084",
+      "constitution_hash": "0x2eb8d8e8b0d977bb63ac1b4d622e2cab08e79906f3b81754c8f5767a0604d784",
+      "register_tx": "0xc8657f456be24a439e7777a8121ec2411d75e68f9df097f435f6d296b26b68c7",
+      "dark_pool_url": "http://localhost:8000/pool?agent=2",
+      "bond_amount_units": 1000000,
+      "operator": "0x7119D50e51abFdd1e589a1185e8E55Edf7a90CeA",
+      "explorer": "https://testnet.arcscan.app/tx/0xc8657f456be24a439e7777a8121ec2411d75e68f9df097f435f6d296b26b68c7"
+    },
+    {
+      "agent_id": 3,
+      "identity_id": 19921,
+      "identity_tx": "0xccd71a1ee824f0772a63aec6d5b406252ae753b361eb84a25481226bfacee44f",
+      "approve_tx": "0xac31dc3a045903a8cd6544dbb67891a025829e0a752f84de906cbe4ff615ac12",
+      "post_tx": "0xdd5b47e95eb4a40795651f54a2779b31c1c84861ff65629a1758afee205e8ee6",
+      "define_tx": "0xa480c5b0e86f8ba79570bf4e7342d3ea81ca0e81f2104f185d31ed6106ba58c4",
+      "constitution_hash": "0x5527c33c46f71bd31ccd1221f252548512e4c19cf6f2bb74250ad444ae44c22b",
+      "register_tx": "0x549865a1ecb173a494350099e592f6eb94c5ea263d73b96af95b3666a0ce2d1c",
+      "dark_pool_url": "http://localhost:8000/pool?agent=3",
+      "bond_amount_units": 1000000,
+      "operator": "0x7119D50e51abFdd1e589a1185e8E55Edf7a90CeA",
+      "explorer": "https://testnet.arcscan.app/tx/0x549865a1ecb173a494350099e592f6eb94c5ea263d73b96af95b3666a0ce2d1c"
+    }
+  ]
+}
