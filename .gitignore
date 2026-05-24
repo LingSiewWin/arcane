@@ -1,9 +1,18 @@
 node_modules/
 .env
 .env.local
+.env.*
+!.env.example
 dist/
 build/
 .DS_Store
+
+# Secrets / keys (defense-in-depth — never commit these)
+*.keystore
+keystore/
+*.mem
+*.key
+*.secret
 
 /docs
 /bench
@@ -22,3 +31,4 @@ build/
 # Local-only backups and screenshots
 *.localfork.bak
 Screenshot*.png
+image.png
