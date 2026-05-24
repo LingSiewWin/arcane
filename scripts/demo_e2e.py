@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """demo_e2e — Phase 2 / Slice 5D end-to-end demo runner.
 
-Two modes:
+Two modes (one MUST be chosen explicitly — there is no default, so the local
+test harness can never be mistaken for the product run path):
 
-  --mode local  (default)
+  --mode local
       Spin up `anvil --fork-url $RPC --chain-id 5042002` so the chain state
       mirrors Arc testnet but no tx leaves the local box. Deploy the four
       contracts to the fork. Start Alice. Drive the 6-step flow. Append one
@@ -996,6 +997,11 @@ def run_local(args) -> int:
         except Exception:
             rpc_url = ""
 
+    print(
+        "LOCAL MODE — forking Arc into a local anvil with a well-known TEST key. "
+        "This is NOT a real broadcast; output is for local verification only.",
+        file=sys.stderr,
+    )
     with anvil_fork(rpc_url, chain_id_override=5042002) as (local_rpc, _proc):
         return run_demo(
             mode="local",
@@ -1065,7 +1071,11 @@ def run_live(args) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["local", "live"], default="local")
+    # No silent default: the caller must choose. `local` is a fork+anvil-key
+    # TEST harness (never a real broadcast); `live` broadcasts to Arc. Forcing
+    # an explicit choice keeps the test path from ever being mistaken for the
+    # product run path.
+    p.add_argument("--mode", choices=["local", "live"], required=True)
     p.add_argument("--rpc-url", default=None)
     p.add_argument("--pk", default=None, help="DEPLOYER_PK (live mode only)")
     p.add_argument(

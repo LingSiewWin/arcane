@@ -1,0 +1,45 @@
+No files changed, compilation skipped
+Script ran successfully.
+
+== Logs ==
+  AgentRegistry       : 0x1b5f29c30a6aB7b1797894C64F4d898f87aC6d25
+    erc8004 (identity): 0x8004A818BFB912233c491871b3d84c89A494BD9e
+  Colosseum           : 0x901e5b1B66b158408CE3Ba145C1b5Be0027cA945
+    recorder          : 0x7119D50e51abFdd1e589a1185e8E55Edf7a90CeA
+  ConstitutionRegistry: 0x2c53eE3253C4Cf9e8c25f91A9A752E6320e68D7B
+  ConstitutionValidator: 0x1B1AC3836CeD5B2FC772e280DE05E823A78cBDFD
+  ConstitutionHook    : 0x890a86182474cb797277EDcf41b70B649575A9a8
+  MemoryAnchor        : 0x2441aeF11F4ff137E4B15B9dbF523A2bD3C9A571
+    identityRegistry  : 0x8004A818BFB912233c491871b3d84c89A494BD9e
+  BondVault           : 0x278a35EF54693896591C51c8F35F72322Ac2C908
+    bondToken (USDC)  : 0x3600000000000000000000000000000000000000
+    oracle            : 0xcF2a36013802Bba718e9d479F3D147DF5dC07982
+    releaseWindow     : 604800
+    livenessTimeout   : 259200
+  PerformanceOracle   : 0xcF2a36013802Bba718e9d479F3D147DF5dC07982
+    pyth              : 0x2880aB155794e7179c9eE2e38200202908C17B43
+    recorder          : 0x7119D50e51abFdd1e589a1185e8E55Edf7a90CeA
+
+## Setting up 1 EVM.
+
+==========================
+
+Chain 5042002
+
+Estimated gas price: 40.001599246 gwei
+
+Estimated total gas used for script: 13351551
+
+Estimated amount required: 0.534083392414530546 ETH
+
+==========================
+
+
+==========================
+
+ONCHAIN EXECUTION COMPLETE & SUCCESSFUL.
+
+Transactions saved to: /Users/lingsiewwin/Documents/Github/AgoraHack/contracts/broadcast/Deploy.s.sol/5042002/run-latest.json
+
+Sensitive values saved to: /Users/lingsiewwin/Documents/Github/AgoraHack/contracts/cache/Deploy.s.sol/5042002/run-latest.json
+
