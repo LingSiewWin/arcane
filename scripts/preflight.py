@@ -54,7 +54,7 @@ from scripts.preflight_checks import (  # noqa: E402
     check_contracts_compiled,
     check_demo_output_writable,
     check_deployer_address,
-    check_deployer_pk_present,
+    check_deployer_key,
     check_env_loaded,
     check_forge_available,
     check_no_old_nonce_db,
@@ -131,8 +131,8 @@ def collect_checks(mode: str) -> list[CheckResult]:
 
     # --- Stage 3: deployer key + USDC (live only) ---------------------------
     if mode == "live":
-        pk_check = check_deployer_pk_present()
-        results.append(pk_check)
+        key_check = check_deployer_key()
+        results.append(key_check)
 
         addr_check = check_deployer_address()
         results.append(addr_check)
@@ -164,6 +164,16 @@ def collect_checks(mode: str) -> list[CheckResult]:
 
 def _go_live_command(deployer_addr: Optional[str]) -> str:
     py = REPO_ROOT / "agents" / ".venv" / "bin" / "python"
+    account = os.environ.get("DEPLOYER_ACCOUNT", "").strip()
+    if account:
+        # Preferred path: encrypted keystore. The key never sits in an env
+        # var — it's decrypted in-process from ~/.foundry/keystores/<account>.
+        return (
+            "    RPC=$RPC \\\n"
+            f"    {py} -m scripts.demo_e2e \\\n"
+            f"        --mode live --account {account} --yes-i-understand\n"
+            "    # password: enter when prompted, or set KEYSTORE_PASSWORD"
+        )
     return (
         "    RPC=$RPC \\\n"
         "    DEPLOYER_PK=$DEPLOYER_PK \\\n"

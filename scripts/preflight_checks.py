@@ -312,11 +312,117 @@ def check_rpc(
 _HEX_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
 
+def check_deployer_key() -> CheckResult:
+    """Deployer key is resolvable for live broadcast.
+
+    GREEN if EITHER:
+      * an encrypted Foundry keystore account is resolvable non-interactively
+        (``--account``/``DEPLOYER_ACCOUNT`` names a keystore that exists AND
+        ``KEYSTORE_PASSWORD`` is set), OR
+      * ``DEPLOYER_PK`` is set + well-formed.
+
+    The keystore path is preferred (Circle's use-arc guidance). When a
+    keystore account is named but its password isn't available
+    non-interactively, we return YELLOW: live broadcast will still work via
+    an interactive prompt, but preflight can't prove it green-light without a
+    human. RED only when no key source exists at all.
+
+    NEVER prints the key or password. Evidence carries only a redacted
+    prefix / the account name.
+    """
+    account = os.environ.get("DEPLOYER_ACCOUNT", "").strip()
+
+    # --- Preferred: encrypted keystore account ----------------------------
+    if account:
+        from scripts.lib.keys import keystore_path
+
+        path = keystore_path(account)
+        if not path.exists():
+            return CheckResult(
+                name="deployer_key",
+                severity=Severity.RED,
+                message=(
+                    f"DEPLOYER_ACCOUNT='{account}' but no keystore at {path}"
+                ),
+                next_step=(
+                    f"Create the keystore:\n"
+                    f"    cast wallet import {account} --interactive"
+                ),
+                evidence={"account": account, "keystore_exists": False},
+            )
+        if os.environ.get("KEYSTORE_PASSWORD") is not None:
+            return CheckResult(
+                name="deployer_key",
+                severity=Severity.GREEN,
+                message=(
+                    f"Deployer key via encrypted keystore '{account}' "
+                    f"(password from KEYSTORE_PASSWORD)"
+                ),
+                evidence={"account": account, "keystore_exists": True, "source": "keystore"},
+            )
+        return CheckResult(
+            name="deployer_key",
+            severity=Severity.YELLOW,
+            message=(
+                f"Keystore '{account}' found; password will be requested "
+                f"interactively at broadcast time"
+            ),
+            next_step=(
+                "Either run live broadcast in an interactive terminal (you'll "
+                "be prompted for the password), or set KEYSTORE_PASSWORD to "
+                "go fully non-interactive."
+            ),
+            evidence={"account": account, "keystore_exists": True, "source": "keystore"},
+        )
+
+    # --- Fallback: DEPLOYER_PK env ----------------------------------------
+    pk = os.environ.get("DEPLOYER_PK", "")
+    if not pk:
+        return CheckResult(
+            name="deployer_key",
+            severity=Severity.RED,
+            message="No deployer key: neither DEPLOYER_ACCOUNT (keystore) nor DEPLOYER_PK set",
+            next_step=(
+                "Preferred — encrypted keystore (key never in an env var):\n"
+                "    cast wallet import deployer --interactive\n"
+                "    export DEPLOYER_ACCOUNT=deployer   # + KEYSTORE_PASSWORD or interactive\n"
+                "Fallback — plain-text key:\n"
+                "    export DEPLOYER_PK=0x<64-hex-chars>"
+            ),
+            evidence={},
+        )
+    if not pk.startswith("0x") or not _HEX_RE.match(pk):
+        return CheckResult(
+            name="deployer_key",
+            severity=Severity.RED,
+            message=(
+                f"DEPLOYER_PK is not a valid 32-byte 0x-prefixed hex key "
+                f"(length={len(pk)}, expected 66 incl. 0x)"
+            ),
+            next_step=(
+                "Verify the key is 0x + 64 hex chars. Regenerate with "
+                "`cast wallet new` if unsure, or prefer a keystore "
+                "(`cast wallet import deployer --interactive`)."
+            ),
+            evidence={"length": len(pk)},
+        )
+    return CheckResult(
+        name="deployer_key",
+        severity=Severity.GREEN,
+        message="Deployer key via DEPLOYER_PK (32 bytes, 0x-prefixed)",
+        evidence={"prefix": pk[:6] + "…", "source": "env_pk"},
+    )
+
+
 def check_deployer_pk_present() -> CheckResult:
     """$DEPLOYER_PK is set, starts with 0x, is exactly 64 hex chars (32 bytes).
 
     Doesn't print the key. Evidence carries only a 6-char prefix for
     correlation between runs.
+
+    Retained for backward-compat (existing tests + the plain-text-key path).
+    New code should prefer ``check_deployer_key()``, which also accepts an
+    encrypted keystore account.
     """
     pk = os.environ.get("DEPLOYER_PK", "")
     if not pk:
@@ -362,18 +468,60 @@ def check_deployer_pk_present() -> CheckResult:
 
 
 def check_deployer_address(pk: Optional[str] = None) -> CheckResult:
-    """Derive the deployer EOA address from $DEPLOYER_PK.
+    """Derive the deployer EOA address from the resolved deployer key.
+
+    Resolves the key the same way live mode does: explicit ``pk`` arg, else
+    a keystore account (``DEPLOYER_ACCOUNT`` + ``KEYSTORE_PASSWORD``, decrypted
+    non-interactively), else ``DEPLOYER_PK``. NEVER prompts here — preflight
+    is non-interactive — and NEVER prints the key.
 
     GREEN if we can derive an address.
-    RED if no PK or derivation failed.
+    RED if no key source is resolvable or derivation failed.
+    YELLOW if a keystore account is named but its password isn't available
+    non-interactively (address can't be derived without a human, but live
+    broadcast can still prompt).
     """
-    pk = pk if pk is not None else os.environ.get("DEPLOYER_PK", "")
+    if pk is None:
+        # No explicit key — resolve from env the same way live mode will.
+        from scripts.lib.keys import KeyResolutionError, resolve_deployer_key
+
+        account = os.environ.get("DEPLOYER_ACCOUNT", "").strip()
+        if account and os.environ.get("KEYSTORE_PASSWORD") is None:
+            # Keystore named but no non-interactive password — can't derive
+            # the address without prompting, which preflight must not do.
+            return CheckResult(
+                name="deployer_address",
+                severity=Severity.YELLOW,
+                message=(
+                    f"Deployer address not derivable non-interactively for "
+                    f"keystore '{account}' (no KEYSTORE_PASSWORD)"
+                ),
+                next_step=(
+                    "Set KEYSTORE_PASSWORD to verify the address + USDC "
+                    "balance in preflight, or proceed and enter the password "
+                    "at broadcast time."
+                ),
+                evidence={"account": account},
+            )
+        if account or os.environ.get("DEPLOYER_PK", "").strip():
+            try:
+                pk = resolve_deployer_key(account=account or None, allow_interactive=False)
+            except KeyResolutionError as e:
+                return CheckResult(
+                    name="deployer_address",
+                    severity=Severity.RED,
+                    message=f"Cannot resolve deployer key: {type(e).__name__}",
+                    next_step="See the deployer_key check for both options.",
+                    evidence={},
+                )
+        else:
+            pk = ""
     if not pk:
         return CheckResult(
             name="deployer_address",
             severity=Severity.RED,
-            message="Cannot derive address: DEPLOYER_PK not set",
-            next_step="Set DEPLOYER_PK (see deployer_pk check)",
+            message="Cannot derive address: no deployer key set",
+            next_step="Set DEPLOYER_ACCOUNT (+ KEYSTORE_PASSWORD) or DEPLOYER_PK (see deployer_key check)",
             evidence={},
         )
     try:

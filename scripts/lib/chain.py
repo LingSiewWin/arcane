@@ -449,6 +449,60 @@ def _encode_validate_user_op(op: PackedUserOp, user_op_hash: bytes) -> str:
     return "0x" + (sel + body).hex()
 
 
+# ---------------------------------------------------------------------------
+# Revert detection
+# ---------------------------------------------------------------------------
+#
+# Phase 4 audit (B1 / Phase-3 #18): the previous implementation used
+# ``revert_seen = revert_seen or True`` in the exception branch, which is
+# unconditionally True for ANY exception — including network timeouts,
+# DNS errors, and gas-estimation failures. That makes step 4 of the demo
+# a liar: a 30-second RPC hiccup would print "constitution revert
+# observed" with no actual on-chain interaction. The fix below distinguishes
+# **runtime reverts** (the EVM bounced the call because the contract told
+# it to) from **transport failures** (the RPC connection itself broke).
+# Only the first counts as a constitution revert; the second raises.
+#
+# A runtime revert produces one of these signatures in the cast / RPC
+# error string. We match conservatively — false positives here lie about
+# success, false negatives correctly raise as transport errors.
+# ---------------------------------------------------------------------------
+
+_REVERT_SIGNATURES = (
+    "execution reverted",          # geth / anvil standard
+    "revert",                       # parity / older clients
+    "vm exception",                 # ganache / hardhat
+    "constitutionviolation",        # our own custom error
+    "0x08c379a0",                   # Error(string) selector
+    "custom error",                 # foundry / cast
+    "revert with custom error",
+)
+
+
+def _is_runtime_revert(err_text: str) -> bool:
+    """Return True iff ``err_text`` clearly indicates an EVM-level revert.
+
+    Network/transport errors (timeouts, connection refused, DNS, malformed
+    JSON, gas estimation failures with no contract bounce) MUST NOT match.
+    We bias toward False — when in doubt, treat as transport error.
+    """
+    if not err_text:
+        return False
+    needle = err_text.lower()
+    return any(sig in needle for sig in _REVERT_SIGNATURES)
+
+
+class TransportError(RuntimeError):
+    """RPC / transport failure — distinct from an on-chain revert.
+
+    Raised by ``call_validate_user_op_expect_revert`` when the underlying
+    JSON-RPC call fails for a reason OTHER than a contract revert (network
+    timeout, connection refused, malformed response, RPC node down, etc.).
+    The demo MUST NOT report this as a successful constitution revert —
+    that lies to the evidence log.
+    """
+
+
 def call_validate_user_op_expect_revert(
     *,
     rpc_url: str,
@@ -458,29 +512,54 @@ def call_validate_user_op_expect_revert(
     deployer_pk: str,
 ) -> tuple[bool, dict]:
     """Send a tx that calls ConstitutionHook.validateUserOp with a payload that
-    SHOULD revert under MAX_LEVERAGE. Returns (revert_observed, evidence).
+    SHOULD revert under MAX_TRADE_SIZE. Returns ``(revert_observed, evidence)``.
 
-    We use eth_call first (cheap, gives us the revert reason without a tx),
-    then optionally send a real tx so we get an actual receipt on the explorer
-    that shows the failure.
+    Phase 4 audit (B1 / Phase-3 #18) hardening:
+
+      * eth_call probe: if it raises and the error string clearly indicates
+        an on-chain revert (``execution reverted`` / ``ConstitutionViolation``
+        / ``0x08c379a0`` etc.), set ``revert_seen=True``. Any OTHER
+        exception is a transport failure — raise ``TransportError`` so the
+        caller cannot mistake it for a successful revert.
+
+      * cast_send broadcast: if the receipt comes back with status=0,
+        that's a real on-chain revert (``revert_seen=True``). If
+        ``cast_send`` itself raises, we again classify the error: an
+        EVM-level revert string sets ``revert_seen=True``; anything else
+        is a transport error and surfaces as ``TransportError``.
+
+    Net effect: a network hiccup during the live broadcast now raises
+    instead of silently printing ``ok=True``.
     """
     callData_bytes = bytes.fromhex(callData.removeprefix("0x"))
     op = PackedUserOp(sender=sender, callData=callData_bytes)
     user_op_hash = bytes(32)
     data = _encode_validate_user_op(op, user_op_hash)
 
-    # eth_call probe — most informative for the revert reason.
     revert_seen = False
     revert_reason = ""
     tx_hash = None
     receipt_status = None
     block_number = None
+
+    # ---- eth_call probe --------------------------------------------------
+    # eth_call is cheap and returns the revert reason directly. We use it
+    # first so a clean revert can be reported even if the broadcast leg
+    # later fails for an unrelated reason.
     try:
+        # ``validateUserOp`` keys its constitution lookup off ``msg.sender``
+        # (``constitutionOf[msg.sender]``). The constitution is installed on
+        # the SCA address (``sender``), so the eth_call MUST spoof ``from``
+        # to that address — otherwise ``msg.sender`` defaults to the zero
+        # address and the call reverts ``NotInstalled()`` long before the
+        # rule logic runs. The real broadcast below already originates from
+        # ``deployer_pk`` (== ``sender`` in the demo), so it agrees.
         rpc_call(
             rpc_url,
             "eth_call",
             [
                 {
+                    "from": sender,
                     "to": hook_address,
                     "data": data,
                 },
@@ -488,11 +567,20 @@ def call_validate_user_op_expect_revert(
             ],
         )
     except RuntimeError as e:
-        revert_seen = True
-        revert_reason = str(e)
+        err_text = str(e)
+        if _is_runtime_revert(err_text):
+            revert_seen = True
+            revert_reason = err_text
+        else:
+            # Network / RPC failure — refuse to silently report success.
+            raise TransportError(
+                f"eth_call transport error (not a revert): {err_text[:300]}"
+            ) from e
 
-    # Now attempt the real tx so a receipt exists. We accept tx failure
-    # (revert) as success for this step.
+    # ---- Real broadcast --------------------------------------------------
+    # Now attempt the real tx so a receipt exists on the explorer. We
+    # accept tx failure (status=0 on a real receipt) as the demo's success
+    # condition.
     try:
         tx_hash = cast_send(
             rpc_url=rpc_url,
@@ -507,9 +595,27 @@ def call_validate_user_op_expect_revert(
         if receipt_status == 0:
             revert_seen = True
     except RuntimeError as e:
-        # cast send may itself error if the local fork rejects the tx pre-flight.
-        revert_seen = revert_seen or True
-        revert_reason = revert_reason or str(e)[:300]
+        err_text = str(e)
+        if _is_runtime_revert(err_text):
+            # cast_send bounced because the pre-flight saw a revert — fine,
+            # that still counts as a constitution revert for our purposes.
+            revert_seen = True
+            if not revert_reason:
+                revert_reason = err_text[:300]
+        else:
+            # Transport-class failure (timeout, connection refused, gas
+            # estimation IO error). We MUST NOT report this as a revert.
+            # If the earlier eth_call already saw a clean revert, surface
+            # both — the evidence dict captures the broadcast error and
+            # the caller still sees a real revert from eth_call.
+            if revert_seen:
+                revert_reason = (
+                    f"{revert_reason} [broadcast transport error: {err_text[:200]}]"
+                )
+            else:
+                raise TransportError(
+                    f"cast_send transport error (not a revert): {err_text[:300]}"
+                ) from e
 
     return revert_seen, {
         "hook_address": hook_address,

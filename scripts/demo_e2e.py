@@ -61,8 +61,11 @@ from agents.orchestrator import (  # noqa: E402
 )
 from agents.seed_alice import seed_alice  # noqa: E402
 from scripts.anchor_memory import anchor_memory  # noqa: E402
+from scripts.resolve_bond import resolve_bond  # noqa: E402
+from scripts.lib.keys import KeyResolutionError, resolve_deployer_key  # noqa: E402
 from scripts.lib.chain import (  # noqa: E402
     cast_address_from_pk,
+    cast_call,
     cast_send,
     chain_id,
     deploy_contract_via_cast,
@@ -79,6 +82,10 @@ ANVIL_DEFAULT_KEY = (
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 )
 USDC_ADDR = "0x3600000000000000000000000000000000000000"
+# Canonical Pyth pull-oracle on Arc testnet (verified on-chain).
+ARC_PYTH_DEFAULT = "0x2880aB155794e7179c9eE2e38200202908C17B43"
+# SOL/USD Pyth feed id used by the PerformanceOracle slash rule.
+SOL_USD_FEED = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
 
 
 def explorer_url(tx_hash: Optional[str]) -> Optional[str]:
@@ -206,16 +213,127 @@ def _artifact(name: str) -> str:
     return str(REPO_ROOT / "contracts" / "out" / f"{name}.sol" / f"{name}.json")
 
 
+def _mock_erc721_artifact() -> str:
+    """Path to the MockERC721 artifact compiled by ``forge build``."""
+    return str(
+        REPO_ROOT
+        / "contracts"
+        / "out"
+        / "MemoryAnchor.t.sol"
+        / "MockERC721.json"
+    )
+
+
+# Phase 4 audit (B5 / N9 / F10): demo's stable identity id. In live
+# mode the caller can override via ``DEMO_IDENTITY_ID``.
+DEMO_DEFAULT_IDENTITY_ID = 42
+
+# Canonical Registered event on the Arc ERC-8004 IdentityRegistry — verified
+# on-chain: keccak256("Registered(uint256,string,address)").
+_REGISTERED_TOPIC = (
+    "0xca52e62c367d81bb2e328eb795f7c7ba24afb478408a26c0e201d155c449bc4a"
+)
+
+
+def register_identity(
+    *,
+    rpc_url: str,
+    pk: str,
+    registry_addr: str,
+    agent_uri: str = "ipfs://bafkreibdi6623n3xpf7ymk62ckb4bo75o3qemwkpfvp5i25j66itxvsoei",
+) -> dict:
+    """Register a fresh ERC-8004 identity OWNED by the deployer on the real
+    Arc IdentityRegistry, returning the minted ``agentId``.
+
+    Bug 1 fix: on live Arc the deployer owns no pre-existing identity, so the
+    hardcoded id 42 (a MockERC721 mint that only exists in local mode) made
+    ``MemoryAnchor.anchor(42, root)`` revert ``NotIdentityOwner`` because
+    ``ownerOf(42) != deployer``. Here we call the canonical
+    ``register(string agentURI, (string,bytes)[] metadata) returns (uint256)``
+    so the deployer mints — and therefore owns — the identity it anchors
+    against.
+
+    The ABI was confirmed against the deployed bytecode at
+    0x8004A818BFB912233c491871b3d84c89A494BD9e (selector 0x8ea42286;
+    ``cast estimate``/``cast call`` from the deployer succeed and the call
+    returns a uint256 agentId). We pass an empty metadata array — the registry
+    accepts it (verified via cast call). The new owner's agentId is parsed from
+    the canonical ``Registered(uint256 indexed agentId, string, address indexed
+    owner)`` event in the receipt.
+
+    Returns ``{"identity_id": int, "register_tx": "0x..."}``.
+    """
+    from eth_abi import encode as abi_encode
+    from eth_utils import keccak
+
+    # register(string,(string,bytes)[]) — empty metadata array.
+    sel = keccak(b"register(string,(string,bytes)[])")[:4]
+    body = abi_encode(
+        ["string", "(string,bytes)[]"],
+        [agent_uri, []],
+    )
+    calldata = "0x" + (sel + body).hex()
+
+    register_tx = cast_send(
+        rpc_url=rpc_url,
+        pk=pk,
+        to=registry_addr,
+        data=calldata,
+        gas_limit=400_000,
+    )
+    receipt = wait_for_receipt(rpc_url, register_tx, timeout=90)
+    if int(receipt.get("status", "0x0"), 16) != 1:
+        raise RuntimeError(
+            f"register() reverted (tx {register_tx}, status "
+            f"{receipt.get('status')}); no identity was minted on {registry_addr}"
+        )
+
+    deployer = cast_address_from_pk(pk)
+    deployer_topic = "0x" + format(int(deployer, 16), "064x")
+    identity_id: Optional[int] = None
+    for lg in receipt.get("logs", []) or []:
+        topics = lg.get("topics") or []
+        if not topics or topics[0].lower() != _REGISTERED_TOPIC.lower():
+            continue
+        if lg.get("address", "").lower() != registry_addr.lower():
+            continue
+        # Registered(uint256 indexed agentId, string agentURI, address indexed owner)
+        # topic[1] = agentId, topic[2] = owner.
+        if len(topics) >= 3 and topics[2].lower() == deployer_topic.lower():
+            identity_id = int(topics[1], 16)
+            break
+    if identity_id is None:
+        raise RuntimeError(
+            f"register() tx {register_tx} succeeded but no Registered event "
+            f"owned by {deployer} was found in the receipt; cannot determine "
+            f"the minted agentId"
+        )
+    return {"identity_id": identity_id, "register_tx": register_tx}
+
+
 def deploy_all_contracts(
     *,
     rpc_url: str,
     pk: str,
     usdc_addr: str = USDC_ADDR,
     bond_window_secs: int = 604800,
+    bond_liveness_secs: int = 259200,  # 3 days — Olas-style liveness timeout
+    mint_local_identity: bool = True,
 ) -> dict[str, dict]:
     """Deploy ConstitutionRegistry, ConstitutionHook, MemoryAnchor, BondVault.
 
-    Returns {name: {"address": "0x...", "tx_hash": "0x..."}}.
+    Phase 4 audit (B5 / N9 / F10): when ``mint_local_identity`` is True we
+    also stand up a MockERC721 identity registry and mint a token (id
+    ``DEMO_DEFAULT_IDENTITY_ID``) to the deployer so the F10
+    identity-bound anchor path can actually execute against an owned
+    identity. Without this, ``anchor(uint256,bytes32)`` reverts with
+    ``NotIdentityOwner`` because the deployer doesn't hold any token on
+    the live Arc ERC-8004 registry from this script.
+
+    Returns ``{name: {"address": "0x...", "tx_hash": "0x..."}, ...,
+    "identity_id": int}``. The ``identity_id`` key is the token the
+    deployer now owns on the registry — pass it through to
+    ``anchor_memory(identity_id=...)``.
     """
     deployer = cast_address_from_pk(pk)
     addrs: dict[str, dict] = {}
@@ -225,26 +343,164 @@ def deploy_all_contracts(
     )
     addrs["ConstitutionRegistry"] = {"address": reg_addr, "tx_hash": reg_tx}
 
+    # ConstitutionHook constructor is (ConstitutionRegistry _registry,
+    # address _token) — the hook tracks the settlement token's balance for
+    # MAX_TRADE_SIZE outcome enforcement (see ConstitutionHook.sol). Pass
+    # both the registry and the USDC address, matching contracts/script/
+    # Deploy.s.sol's ``new ConstitutionHook(registry, usdc)``.
     hook_addr, hook_tx = deploy_contract_via_cast(
         rpc_url=rpc_url,
         pk=pk,
         artifact_path=_artifact("ConstitutionHook"),
-        constructor_args=[reg_addr],
+        constructor_args=[reg_addr, usdc_addr],
     )
     addrs["ConstitutionHook"] = {"address": hook_addr, "tx_hash": hook_tx}
 
-    anchor_addr, anchor_tx = deploy_contract_via_cast(
-        rpc_url=rpc_url, pk=pk, artifact_path=_artifact("MemoryAnchor")
+    # ConstitutionValidator is the ERC-7579 type-1 validator — the
+    # gatekeeper whose ``validateUserOp`` reverts a violating user-op with
+    # ``ConstitutionViolation:<RULE>``. The type-4 ConstitutionHook above
+    # owns preCheck/postCheck; the validator owns userOp validation. The
+    # demo's step-4 revert proof drives ``validateUserOp`` so it MUST hit
+    # the validator, not the hook. Constructor is (ConstitutionRegistry
+    # _registry) — matches contracts/script/Deploy.s.sol.
+    validator_addr, validator_tx = deploy_contract_via_cast(
+        rpc_url=rpc_url,
+        pk=pk,
+        artifact_path=_artifact("ConstitutionValidator"),
+        constructor_args=[reg_addr],
     )
-    addrs["MemoryAnchor"] = {"address": anchor_addr, "tx_hash": anchor_tx}
+    addrs["ConstitutionValidator"] = {
+        "address": validator_addr,
+        "tx_hash": validator_tx,
+    }
 
+    # F10 / B5: choose the identity registry. In local-mode (mint_local_identity)
+    # we deploy MockERC721 and mint identityId=42 to the deployer. In live
+    # mode against Arc, point at the canonical ERC-8004 registry at 0x8004…
+    # and require the caller to have already minted a token they own
+    # (DEMO_IDENTITY_ID env var).
+    identity_id = int(os.environ.get("DEMO_IDENTITY_ID", DEMO_DEFAULT_IDENTITY_ID))
+    if mint_local_identity:
+        # Deploy MockERC721 and mint identityId to deployer so anchor()
+        # can verify ownership and emit a non-zero identityId topic.
+        mock_registry_addr, mock_registry_tx = deploy_contract_via_cast(
+            rpc_url=rpc_url,
+            pk=pk,
+            artifact_path=_mock_erc721_artifact(),
+        )
+        mint_tx = cast_send(
+            rpc_url=rpc_url,
+            pk=pk,
+            to=mock_registry_addr,
+            sig="mint(address,uint256)",
+            args=[deployer, str(identity_id)],
+            gas_limit=200_000,
+        )
+        wait_for_receipt(rpc_url, mint_tx, timeout=60)
+        addrs["IdentityRegistry"] = {
+            "address": mock_registry_addr,
+            "tx_hash": mock_registry_tx,
+            "minted_identity_id": identity_id,
+            "minted_to": deployer,
+            "mint_tx": mint_tx,
+        }
+        identity_registry_addr = mock_registry_addr
+    else:
+        # Live mode: use the official Arc ERC-8004 registry AND register a
+        # fresh identity the deployer actually owns (Bug 1 fix). The deployer
+        # owns no pre-existing identity on real Arc, so anchoring against the
+        # hardcoded id 42 reverts NotIdentityOwner. We mint one here via the
+        # canonical register(string,(string,bytes)[]) and use its agentId.
+        identity_registry_addr = os.environ.get(
+            "ARC_IDENTITY_REGISTRY",
+            "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+        )
+        reg_result = register_identity(
+            rpc_url=rpc_url,
+            pk=pk,
+            registry_addr=identity_registry_addr,
+        )
+        identity_id = reg_result["identity_id"]
+        addrs["IdentityRegistry"] = {
+            "address": identity_registry_addr,
+            "tx_hash": None,
+            "external": True,
+            "registered_identity_id": identity_id,
+            "registered_to": deployer,
+            "register_tx": reg_result["register_tx"],
+        }
+
+    anchor_addr, anchor_tx = deploy_contract_via_cast(
+        rpc_url=rpc_url,
+        pk=pk,
+        artifact_path=_artifact("MemoryAnchor"),
+        constructor_args=[identity_registry_addr],
+    )
+    addrs["MemoryAnchor"] = {
+        "address": anchor_addr,
+        "tx_hash": anchor_tx,
+        "identity_id": identity_id,
+    }
+
+    # Phase 5 Stream I: BondVault constructor is now
+    # (IERC20 token, address oracle, uint256 releaseWindow, uint256 livenessTimeout)
+    # — the Erasure double-burn vault has NO insurance pool (slashed funds
+    # burn to 0x…dEaD), so the old `insurance` arg is gone.
     vault_addr, vault_tx = deploy_contract_via_cast(
         rpc_url=rpc_url,
         pk=pk,
         artifact_path=_artifact("BondVault"),
-        constructor_args=[usdc_addr, deployer, deployer, str(bond_window_secs)],
+        constructor_args=[
+            usdc_addr,
+            deployer,
+            str(bond_window_secs),
+            str(bond_liveness_secs),
+        ],
     )
     addrs["BondVault"] = {"address": vault_addr, "tx_hash": vault_tx}
+
+    # PerformanceOracle: the real Pyth-driven slash judge. Constructor is
+    # (IPyth pyth, IBondVault vault, IERC20 bondToken, address recorder).
+    # On Arc the canonical Pyth pull-oracle lives at ARC_PYTH; the recorder
+    # is the deployer (it commits Alice's advice on her behalf).
+    arc_pyth = os.environ.get("ARC_PYTH", ARC_PYTH_DEFAULT)
+    perf_addr, perf_tx = deploy_contract_via_cast(
+        rpc_url=rpc_url,
+        pk=pk,
+        artifact_path=_artifact("PerformanceOracle"),
+        constructor_args=[arc_pyth, vault_addr, usdc_addr, deployer],
+    )
+    addrs["PerformanceOracle"] = {
+        "address": perf_addr,
+        "tx_hash": perf_tx,
+        "pyth": arc_pyth,
+    }
+
+    # Hand the BondVault's oracle role to PerformanceOracle so it (and only
+    # it) can slash — and only after posting its own Erasure counter-bond.
+    set_oracle_tx = cast_send(
+        rpc_url=rpc_url,
+        pk=pk,
+        to=vault_addr,
+        sig="setOracle(address)",
+        args=[perf_addr],
+        gas_limit=120_000,
+    )
+    wait_for_receipt(rpc_url, set_oracle_tx, timeout=60)
+    addrs["PerformanceOracle"]["set_oracle_tx"] = set_oracle_tx
+
+    # Phase 5 B16: a MAX_LEVERAGE rule requires a non-zero adapter at
+    # registration (ConstitutionRegistry reverts AdapterRequired(0) otherwise).
+    # Deploy the real GmxV2PerpAdapter so Bob's leverage cap is genuinely
+    # enforceable — the rule is wired to it in run_demo before defineConstitution.
+    gmx_addr, gmx_tx = deploy_contract_via_cast(
+        rpc_url=rpc_url,
+        pk=pk,
+        artifact_path=_artifact("GmxV2PerpAdapter"),
+    )
+    addrs["GmxV2PerpAdapter"] = {"address": gmx_addr, "tx_hash": gmx_tx}
+
+    addrs["identity_id"] = identity_id  # convenience top-level key
 
     return addrs
 
@@ -262,9 +518,14 @@ def define_constitution(
 
     from agents.bob import rules_to_solidity
 
+    # ConstitutionRegistry.Rule is (uint8 kind, bytes params, address adapter)
+    # since Phase 5 Stream M. The selector and ABI encoding MUST include the
+    # adapter field, otherwise the registry decodes garbage / reverts and the
+    # constitution is never actually stored — which then makes onInstall
+    # revert UnknownConstitution downstream.
     sol_rules = rules_to_solidity(rules_dicts)
-    sel = keccak(b"defineConstitution((uint8,bytes)[])")[:4]
-    body = abi_encode(["(uint8,bytes)[]"], [sol_rules])
+    sel = keccak(b"defineConstitution((uint8,bytes,address)[])")[:4]
+    body = abi_encode(["(uint8,bytes,address)[]"], [sol_rules])
     data = "0x" + (sel + body).hex()
 
     tx_hash = cast_send(
@@ -274,7 +535,12 @@ def define_constitution(
         data=data,
         gas_limit=1_000_000,
     )
-    wait_for_receipt(rpc_url, tx_hash, timeout=60)
+    receipt = wait_for_receipt(rpc_url, tx_hash, timeout=60)
+    if int(receipt.get("status", "0x0"), 16) != 1:
+        raise RuntimeError(
+            f"defineConstitution reverted (tx {tx_hash}, status "
+            f"{receipt.get('status')}); the constitution was not stored"
+        )
     return hash_constitution(rules_dicts), tx_hash
 
 
@@ -313,6 +579,99 @@ def post_bond(
     return {"approve_tx": approve_tx, "post_tx": post_tx}
 
 
+def record_advice(
+    *,
+    rpc_url: str,
+    pk: str,
+    oracle_addr: str,
+    agent: str,
+    feed_id: str = SOL_USD_FEED,
+    direction: int = 1,
+    horizon_secs: int = 1,
+    slash_threshold_bps: int = 1,
+    slash_amount_units: int = 100_000,
+    pyth_addr: str = ARC_PYTH_DEFAULT,
+) -> dict:
+    """Commit `agent`'s trading advice to the PerformanceOracle.
+
+    Bug 2 fix: recordAdvice now refreshes Pyth on-chain BEFORE snapshotting
+    p0 (the on-chain SOL/USD price on Arc is frequently older than the Pyth
+    valid time period, so reading it without a fresh push reverts StalePrice).
+    We therefore FIRST fetch a REAL Hermes VAA (free, no key), read the real
+    Arc Pyth `getUpdateFee`, then call the now-payable
+    ``recordAdvice(address,bytes32,int8,uint64,uint32,uint256,bytes[])`` with
+    the VAA + that fee as value. Real Hermes, no mock.
+
+    The demo uses an aggressive `slash_threshold_bps` over a short
+    `horizon_secs` so that a real (tiny) adverse SOL/USD move at resolution
+    predictably trips the slash rule — the price check is genuinely live,
+    only the claimed tolerance is aggressive (disclosed, not faked).
+
+    Returns the recordAdvice tx hash plus the live Hermes price snapshot.
+    """
+    from eth_abi import encode as abi_encode
+    from eth_utils import keccak, to_canonical_address
+
+    # 1. Fetch a REAL Hermes VAA for p0 (free, no key). Reuses the same source
+    #    resolve_bond uses for p1, so record + resolve share one price oracle.
+    from scripts.resolve_bond import fetch_hermes_vaa
+
+    hermes = fetch_hermes_vaa(feed_id)
+    vaa_hex = hermes["vaa"]
+
+    # 2. Read the REAL Arc Pyth update fee for [vaa].
+    fee_out = cast_call(
+        rpc_url=rpc_url,
+        to=pyth_addr,
+        sig="getUpdateFee(bytes[])(uint256)",
+        args=["[" + vaa_hex + "]"],
+    )
+    fee = int(fee_out.split()[0])
+
+    # 3. ABI-encode recordAdvice(address,bytes32,int8,uint64,uint32,uint256,bytes[]).
+    #    cast calldata can't synthesise the dynamic bytes[] arg cleanly, so we
+    #    encode in Python (same approach resolve_bond uses for resolve()).
+    sel = keccak(
+        b"recordAdvice(address,bytes32,int8,uint64,uint32,uint256,bytes[])"
+    )[:4]
+    feed_bytes = bytes.fromhex(feed_id.removeprefix("0x"))
+    vaa_bytes = bytes.fromhex(vaa_hex.removeprefix("0x"))
+    body = abi_encode(
+        ["address", "bytes32", "int8", "uint64", "uint32", "uint256", "bytes[]"],
+        [
+            to_canonical_address(agent),
+            feed_bytes,
+            int(direction),
+            int(horizon_secs),
+            int(slash_threshold_bps),
+            int(slash_amount_units),
+            [vaa_bytes],
+        ],
+    )
+    calldata = "0x" + (sel + body).hex()
+
+    record_tx = cast_send(
+        rpc_url=rpc_url,
+        pk=pk,
+        to=oracle_addr,
+        data=calldata,
+        value=fee,
+        gas_limit=1_500_000,
+    )
+    receipt = wait_for_receipt(rpc_url, record_tx, timeout=60)
+    if int(receipt.get("status", "0x0"), 16) != 1:
+        raise RuntimeError(
+            f"recordAdvice reverted (tx {record_tx}); p0 was not snapshotted"
+        )
+    return {
+        "record_advice_tx": record_tx,
+        "update_fee": fee,
+        "hermes_p0": hermes["price"],
+        "hermes_p0_float": hermes["price_float"],
+        "hermes_p0_publish_time": hermes["publish_time"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Demo flow
 # ---------------------------------------------------------------------------
@@ -344,9 +703,24 @@ def run_demo(
     overall_ok = True
     try:
         # Deploy contracts (counts as part of step 1 evidence).
-        addrs = deploy_all_contracts(rpc_url=rpc_url, pk=pk)
+        # Phase 4 audit (B5 / F10): local mode mints its own MockERC721
+        # identity; live mode uses the deployed Arc ERC-8004 registry
+        # and expects the operator to have already minted a token.
+        addrs = deploy_all_contracts(
+            rpc_url=rpc_url,
+            pk=pk,
+            mint_local_identity=(mode == "local"),
+        )
         # ---- Step 1: spawn Bob + define his constitution on-chain
         rules = default_bob_rules()
+        # B16: the MAX_LEVERAGE rule requires a non-zero adapter at
+        # registration. Wire the just-deployed GmxV2PerpAdapter so the
+        # leverage cap is genuinely enforceable (and defineConstitution
+        # doesn't revert AdapterRequired(0)).
+        gmx_adapter = addrs["GmxV2PerpAdapter"]["address"]
+        for r in rules:
+            if r.get("kind") == "MAX_LEVERAGE" and not r.get("adapter"):
+                r["adapter"] = gmx_adapter
         t0 = time.time()
         constitution_hash, define_tx = define_constitution(
             rpc_url=rpc_url,
@@ -404,9 +778,17 @@ def run_demo(
         # ---- Step 4: attempt violating trade — MUST revert
         t0 = time.time()
         # Install the constitution on Bob's "SCA" (here we use the deployer as
-        # the smart account for the local demo) so the hook has something to
-        # check. In real Arc flow this is done by spawn_agent.ts.
-        # cast send hook.onInstall(abi.encode(constitutionHash))
+        # the smart account for the local demo) so the validator has something
+        # to check. In real Arc flow this is done by spawn_agent.ts.
+        # cast send validator.onInstall(abi.encode(constitutionHash))
+        #
+        # The revert proof drives ``validateUserOp``, which lives on the
+        # ConstitutionValidator (type-1), NOT the type-4 ConstitutionHook —
+        # so we install on and call the validator. ``validateUserOp`` keys
+        # off ``constitutionOf[msg.sender]``, and the revert helper sends
+        # from ``deployer_pk`` with ``sender=deployer``, so the install
+        # (whose onInstall msg.sender is the deployer) and the call agree.
+        validator_addr = addrs["ConstitutionValidator"]["address"]
         from eth_utils import keccak
         install_sel = keccak(b"onInstall(bytes)")[:4]
         # `bytes` arg: dynamic offset 0x20, length 0x20, payload = constitutionHash
@@ -420,7 +802,7 @@ def run_demo(
             install_tx = cast_send(
                 rpc_url=rpc_url,
                 pk=pk,
-                to=addrs["ConstitutionHook"]["address"],
+                to=validator_addr,
                 data=install_data,
                 gas_limit=300_000,
             )
@@ -432,7 +814,7 @@ def run_demo(
         revert_seen, revert_evidence = step_attempt_violating_trade(
             bob,
             rpc_url=rpc_url,
-            hook_address=addrs["ConstitutionHook"]["address"],
+            hook_address=validator_addr,
             deployer_pk=pk,
             sca_address=deployer,
         )
@@ -453,14 +835,27 @@ def run_demo(
         # ---- Step 5: decay + pinned root + anchor on chain
         t0 = time.time()
         stable, decay_ev = step_decay_check_pinned(memory_path)
-        # Anchor the (unchanged) pinned root.
+        # Phase 4 audit (B5 / N9 / F10): anchor the (unchanged) pinned
+        # root via the identity-bound entry point. The deployer owns
+        # ``addrs["identity_id"]`` on the registry (minted at deploy time
+        # in local mode, pre-minted by the operator in live mode), so the
+        # ownerOf check inside MemoryAnchor.anchor succeeds.
         anchor_result = anchor_memory(
             rpc_url=rpc_url,
             pk=pk,
             anchor_address=addrs["MemoryAnchor"]["address"],
             root_hex=decay_ev["pinned_root_after"],
+            identity_id=addrs["identity_id"],
         )
-        ok5 = stable and anchor_result.get("event_emitted", False)
+        # ok5 is True only when the pinned root is stable AND the F10
+        # identity-bound event fired AND its topic[2] matches our id —
+        # never accept an event that came in with identityId=0 on the
+        # identity-bound path.
+        ok5 = (
+            stable
+            and anchor_result.get("event_emitted", False)
+            and anchor_result.get("event_identity_id_matches", False)
+        )
         writer.append(
             step=5,
             name="anchor_pinned_root",
@@ -470,14 +865,24 @@ def run_demo(
             evidence={**decay_ev, **anchor_result, "pinned_root_stable": stable},
         )
 
-        # ---- Step 6: child + bond resolution (slash + release)
+        # ---- Step 6: child + REAL Pyth-driven bond resolution
         t0 = time.time()
         child_dict, child_ev = step_spawn_child_and_resolve_bond(bob)
-        # We attempt a real `post(1 USDC)` and `slash(deployer, 100000)` to
-        # produce on-chain evidence. The deployer is both bond owner AND
-        # oracle in this demo, which lets us slash without separate keys.
-        usdc_amount_one = 1_000_000
+        # The real sequence:
+        #   1. deployer posts a 1 USDC bond (the bonded "agent" here).
+        #   2. PerformanceOracle.recordAdvice snapshots a REAL Pyth SOL/USD p0
+        #      with an aggressive 1 bps slash threshold over a 1s horizon —
+        #      the price check is genuinely live; only the tolerance is
+        #      aggressive (disclosed, not faked) so a tiny adverse tick slashes.
+        #   3. fund the oracle with USDC so it can post its own Erasure
+        #      counter-bond at slash time (skin in the game).
+        #   4. scripts/resolve_bond.py fetches a REAL Hermes VAA and submits
+        #      PerformanceOracle.resolve(deployer, [vaa]) — real slash or
+        #      release on Arc, with a real tx hash.
+        usdc_amount_one = 1_000_000  # 1 USDC bond
+        slash_amount = 100_000  # 0.1 USDC slashed on failure
         bond_evidence: dict[str, Any] = {}
+        perf_addr = addrs["PerformanceOracle"]["address"]
         try:
             bond_result = post_bond(
                 rpc_url=rpc_url,
@@ -487,22 +892,54 @@ def run_demo(
                 amount_units=usdc_amount_one,
             )
             bond_evidence["bond_post"] = bond_result
-            slash_tx = cast_send(
+
+            # Fund the oracle so it can post its Erasure counter-bond when it
+            # slashes (the oracle burns its own counter-bond alongside the
+            # agent's bond — no skin, no slash).
+            fund_oracle_tx = cast_send(
                 rpc_url=rpc_url,
                 pk=pk,
-                to=addrs["BondVault"]["address"],
-                sig="slash(address,uint256)",
-                args=[deployer, "100000"],
-                gas_limit=300_000,
+                to=USDC_ADDR,
+                sig="transfer(address,uint256)",
+                args=[perf_addr, str(slash_amount)],
+                gas_limit=200_000,
             )
-            wait_for_receipt(rpc_url, slash_tx, timeout=60)
-            bond_evidence["slash_tx"] = slash_tx
+            wait_for_receipt(rpc_url, fund_oracle_tx, timeout=60)
+            bond_evidence["fund_oracle_tx"] = fund_oracle_tx
+
+            # Record advice: real Pyth p0, aggressive 1 bps threshold, 1s horizon.
+            advice_result = record_advice(
+                rpc_url=rpc_url,
+                pk=pk,
+                oracle_addr=perf_addr,
+                agent=deployer,
+                feed_id=SOL_USD_FEED,
+                direction=1,
+                horizon_secs=1,
+                slash_threshold_bps=1,
+                slash_amount_units=slash_amount,
+                pyth_addr=os.environ.get("ARC_PYTH", ARC_PYTH_DEFAULT),
+            )
+            bond_evidence["record_advice"] = advice_result
+
+            # Let the 1s horizon elapse, then resolve with a real Hermes VAA.
+            time.sleep(2)
+            resolve_result = resolve_bond(
+                rpc_url=rpc_url,
+                pk=pk,
+                oracle_addr=perf_addr,
+                agent=deployer,
+                pyth_addr=os.environ.get("ARC_PYTH", ARC_PYTH_DEFAULT),
+                feed_id=SOL_USD_FEED,
+            )
+            bond_evidence["resolve"] = resolve_result
             bond_evidence["bond_resolved"] = True
-            top_tx = slash_tx
+            top_tx = resolve_result["tx_hash"]
         except RuntimeError as e:
             # Bond flow can fail in local mode if the deployer doesn't have
-            # USDC. We still report step success if at least the child spawn
-            # worked, with the bond failure captured in evidence.
+            # USDC, or if anvil's fork lacks the live Pyth price. We still
+            # report step success if the child spawn worked, with the bond
+            # failure captured in evidence.
             bond_evidence["error"] = str(e)[:300]
             bond_evidence["bond_resolved"] = False
             top_tx = None
@@ -579,10 +1016,23 @@ def run_live(args) -> int:
         )
         return 2
 
-    pk = args.pk or os.environ.get("DEPLOYER_PK", "")
+    # Resolve the deployer key. Priority: explicit --pk > keystore account
+    # (--account / DEPLOYER_ACCOUNT, decrypted in-process) > DEPLOYER_PK env.
+    # The keystore path is preferred per Circle's use-arc guidance: the raw
+    # key never sits in an env var. Whatever the source, the resolved key
+    # stays in-process and chain.py signs locally.
     rpc_url = args.rpc_url or os.environ.get("RPC", "")
+    if args.pk:
+        pk = args.pk
+    else:
+        try:
+            pk = resolve_deployer_key(account=args.account, allow_interactive=True)
+        except KeyResolutionError as e:
+            # NEVER print the key or password — only the actionable guidance.
+            print(f"REFUSING: {e}", file=sys.stderr)
+            return 3
     if not pk:
-        print("REFUSING: --mode live requires DEPLOYER_PK env var or --pk.", file=sys.stderr)
+        print("REFUSING: --mode live requires DEPLOYER_PK env var, --pk, or --account.", file=sys.stderr)
         return 3
     if not rpc_url:
         print("REFUSING: --mode live requires RPC env var or --rpc-url.", file=sys.stderr)
@@ -618,6 +1068,17 @@ def main() -> int:
     p.add_argument("--mode", choices=["local", "live"], default="local")
     p.add_argument("--rpc-url", default=None)
     p.add_argument("--pk", default=None, help="DEPLOYER_PK (live mode only)")
+    p.add_argument(
+        "--account",
+        default=None,
+        help=(
+            "Encrypted Foundry keystore name in ~/.foundry/keystores/ "
+            "(live mode, preferred over --pk/DEPLOYER_PK). Decrypted "
+            "in-process via eth_account; password from KEYSTORE_PASSWORD or "
+            "an interactive prompt. Create with `cast wallet import <name> "
+            "--interactive`."
+        ),
+    )
     p.add_argument(
         "--yes-i-understand",
         action="store_true",

@@ -37,6 +37,7 @@ from scripts.preflight_checks import (  # noqa: E402
     check_contracts_compiled,
     check_demo_output_writable,
     check_deployer_address,
+    check_deployer_key,
     check_deployer_pk_present,
     check_env_loaded,
     check_forge_available,
@@ -530,7 +531,7 @@ def test_preflight_green_in_full_setup(monkeypatch):
         "check_no_old_nonce_db",
         "check_env_loaded",
         "check_rpc",
-        "check_deployer_pk_present",
+        "check_deployer_key",
         "check_deployer_address",
         "check_usdc_balance",
     ]
@@ -548,7 +549,7 @@ def test_preflight_green_in_full_setup(monkeypatch):
         "check_no_old_nonce_db": "nonce_db",
         "check_env_loaded": "env_loaded",
         "check_rpc": "rpc",
-        "check_deployer_pk_present": "deployer_pk",
+        "check_deployer_key": "deployer_key",
         "check_deployer_address": "deployer_address",
         "check_usdc_balance": "usdc_balance",
     }
@@ -580,7 +581,7 @@ def test_preflight_strict_promotes_yellow_to_failure(monkeypatch):
         "check_alice_memory_seeded": "alice_memory",
         "check_env_loaded": "env_loaded",
         "check_rpc": "rpc",
-        "check_deployer_pk_present": "deployer_pk",
+        "check_deployer_key": "deployer_key",
         "check_deployer_address": "deployer_address",
         "check_usdc_balance": "usdc_balance",
     }
