@@ -68,6 +68,7 @@ export async function spawnAgent(
     parentSessionKey,
     metadataURI = DEFAULT_METADATA_URI,
     scopes = DEFAULT_SCOPES,
+    darkPoolEndpoint,
   } = input;
   const dryRun = input.dryRun ?? true;
 
@@ -98,12 +99,16 @@ export async function spawnAgent(
     dryRun,
   });
 
-  // Step 4: ERC-8004 identity mint.
+  // Step 4: ERC-8004 identity mint via canonical register(string,(string,bytes)[])
+  //         + setAgentWallet binding of the Turnkey EOA to the agentId.
   const identity = await mintIdentity({
     sca,
     constitutionHash,
     metadataURI,
     dryRun,
+    turnkeyEoa: eoa,
+    agentName: name,
+    ...(darkPoolEndpoint !== undefined && { darkPoolEndpoint }),
   });
 
   // Step 5: Issue the session key. If parent supplied, enforce subset bounds.
@@ -123,8 +128,12 @@ export async function spawnAgent(
     identityId: identity.identityId,
     sessionKey,
     turnkeyEoa: eoa.address,
+    metadataEntries: identity.metadataEntries,
     txHashes: {
-      ...(identity.txHash && { identityMint: identity.txHash }),
+      ...(identity.registerTxHash && { identityMint: identity.registerTxHash }),
+      ...(identity.setWalletTxHash && {
+        identitySetAgentWallet: identity.setWalletTxHash,
+      }),
       ...(sca.deployTxHash && { scaDeploy: sca.deployTxHash }),
       ...(sessionKey.installTxHash && {
         sessionKeyIssue: sessionKey.installTxHash,

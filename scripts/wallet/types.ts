@@ -81,9 +81,18 @@ export type AgentSpawnResult = {
   sessionKey: SessionKeyAuth;
   /** Raw Turnkey EOA address — this signs x402 payloads via ecrecover. */
   turnkeyEoa: EthAddress;
+  /**
+   * Canonical ERC-8004 MetadataEntry[] we attached at register-time. Keys we
+   * always set: "constitutionHash" (bytes32) and optionally "dark_pool_endpoint"
+   * (utf8 url bytes) + "agentName" (utf8 bytes). Shape matches the upstream
+   * `IdentityRegistryUpgradeable.register(string, (string,bytes)[])` ABI.
+   */
+  metadataEntries: Array<{ metadataKey: string; metadataValue: HexString }>;
   /** Transaction hashes for each step. Undefined when the step was dry-run-skipped. */
   txHashes: {
     identityMint?: HexString;
+    /** Canonical ERC-8004 setAgentWallet binding tx (binds the Turnkey EOA to the agentId). */
+    identitySetAgentWallet?: HexString;
     scaDeploy?: HexString;
     sessionKeyIssue?: HexString;
   };
@@ -102,6 +111,12 @@ export type SpawnAgentInput = {
   scopes?: SessionScope[];
   /** Optional metadata URI for ERC-8004; defaults to the canonical demo placeholder. */
   metadataURI?: string;
+  /**
+   * Optional dark-pool URL to advertise in ERC-8004 metadata under the
+   * "dark_pool_endpoint" key. ERC-8004-aware indexers can discover this agent's
+   * x402-paywalled query endpoint without parsing the agentURI JSON.
+   */
+  darkPoolEndpoint?: string;
 };
 
 /** A Turnkey-or-local EOA descriptor. */

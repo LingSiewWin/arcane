@@ -54,6 +54,7 @@ import {
   formatUsdc,
 } from "../circle_gateway.js";
 import {
+  SignerUnusableError,
   X402AmountExceededError,
   X402ServerRefusedError,
   type PaymentRequirements,
@@ -330,6 +331,154 @@ describe("EIP-712 / EIP-3009 signing", () => {
         maxAmountBaseUnits: PRICE_BASE_UNITS,
       });
     }).toThrow(X402AmountExceededError);
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 3 audit (F11) — signer-level recipient + amount pinning
+  // -------------------------------------------------------------------------
+
+  it("test_signer_rejects_wrong_expected_recipient — refuses to sign", async () => {
+    // The server says "pay X". The caller pinned "pay Y". The signer
+    // MUST throw before it touches the EOA, so funds are never at risk.
+    const eoa = localEoa();
+    const signer = new TurnkeyEoaSigner(eoa);
+    const advertisedPayTo = freshRecipient().address;
+    const pinnedRecipient = freshRecipient().address;
+    expect(advertisedPayTo.toLowerCase()).not.toBe(pinnedRecipient.toLowerCase());
+
+    const requirements: PaymentRequirements = {
+      scheme: "exact",
+      network: NETWORK,
+      maxAmountRequired: "1000",
+      resource: "/query",
+      description: "test",
+      mimeType: "application/json",
+      payTo: advertisedPayTo,
+      maxTimeoutSeconds: 60,
+      asset: USDC_ARC,
+      extra: { name: "USDC", version: "2" },
+    };
+    await expect(
+      signTransferWithAuthorization({
+        signer,
+        requirements,
+        chainId: ARC_CHAIN_ID,
+        value: 1000n,
+        validForSeconds: 60,
+        expectedRecipient: pinnedRecipient,
+      }),
+    ).rejects.toBeInstanceOf(SignerUnusableError);
+  });
+
+  it("test_signer_accepts_matching_expected_recipient — round-trip OK", async () => {
+    // When the caller's pinned recipient matches the server's payTo, the
+    // signer proceeds and the resulting signature recovers to the EOA.
+    const eoa = localEoa();
+    const signer = new TurnkeyEoaSigner(eoa);
+    const recipient = freshRecipient().address;
+    const requirements: PaymentRequirements = {
+      scheme: "exact",
+      network: NETWORK,
+      maxAmountRequired: "1000",
+      resource: "/query",
+      description: "test",
+      mimeType: "application/json",
+      payTo: recipient,
+      maxTimeoutSeconds: 60,
+      asset: USDC_ARC,
+      extra: { name: "USDC", version: "2" },
+    };
+    const auth = await signTransferWithAuthorization({
+      signer,
+      requirements,
+      chainId: ARC_CHAIN_ID,
+      value: 1000n,
+      validForSeconds: 60,
+      expectedRecipient: recipient,
+    });
+    const recovered = await recoverTypedDataAddress({
+      domain: {
+        name: "USDC",
+        version: "2",
+        chainId: ARC_CHAIN_ID,
+        verifyingContract: USDC_ARC,
+      },
+      types: EIP3009_TRANSFER_TYPES as unknown as Record<
+        string,
+        Array<{ name: string; type: string }>
+      >,
+      primaryType: "TransferWithAuthorization",
+      message: {
+        from: auth.authorization.from,
+        to: auth.authorization.to,
+        value: auth.authorization.value,
+        validAfter: auth.authorization.validAfter,
+        validBefore: auth.authorization.validBefore,
+        nonce: auth.authorization.nonce,
+      },
+      signature: auth.signature,
+    });
+    expect(recovered.toLowerCase()).toBe(eoa.address.toLowerCase());
+  });
+
+  it("test_signer_rejects_excessive_max_amount — strict cap at building block", async () => {
+    // The server is asking for 1_000_000 base units but the caller's hard
+    // cap is 100. The signer must reject BEFORE touching the EOA.
+    const eoa = localEoa();
+    const signer = new TurnkeyEoaSigner(eoa);
+    const recipient = freshRecipient().address;
+    const requirements: PaymentRequirements = {
+      scheme: "exact",
+      network: NETWORK,
+      maxAmountRequired: "1000000",
+      resource: "/query",
+      description: "test",
+      mimeType: "application/json",
+      payTo: recipient,
+      maxTimeoutSeconds: 60,
+      asset: USDC_ARC,
+      extra: { name: "USDC", version: "2" },
+    };
+    await expect(
+      signTransferWithAuthorization({
+        signer,
+        requirements,
+        chainId: ARC_CHAIN_ID,
+        value: 1000n,
+        validForSeconds: 60,
+        maxAmountBaseUnits: 100n,
+      }),
+    ).rejects.toBeInstanceOf(X402AmountExceededError);
+  });
+
+  it("test_signer_rejects_excessive_value — caller-supplied value also capped", async () => {
+    // Even when the server's quote is within the cap, a caller bug that
+    // hands in an inflated ``value`` must be rejected.
+    const eoa = localEoa();
+    const signer = new TurnkeyEoaSigner(eoa);
+    const recipient = freshRecipient().address;
+    const requirements: PaymentRequirements = {
+      scheme: "exact",
+      network: NETWORK,
+      maxAmountRequired: "100", // within cap
+      resource: "/query",
+      description: "test",
+      mimeType: "application/json",
+      payTo: recipient,
+      maxTimeoutSeconds: 60,
+      asset: USDC_ARC,
+      extra: { name: "USDC", version: "2" },
+    };
+    await expect(
+      signTransferWithAuthorization({
+        signer,
+        requirements,
+        chainId: ARC_CHAIN_ID,
+        value: 999_999n, // BUSTS the cap
+        validForSeconds: 60,
+        maxAmountBaseUnits: 1000n,
+      }),
+    ).rejects.toBeInstanceOf(X402AmountExceededError);
   });
 
   it("authorization digest is stable across identical inputs", async () => {
