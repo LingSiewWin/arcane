@@ -190,17 +190,28 @@ class Alice:
             )
             if cache_ok:
                 log.info("Alice: loading memory cache from %s", self.mem_path)
-                cached = MemoryService.load(self.mem_path)
+                # A cache in an incompatible/old format (e.g. a pre-v3 npz, or a
+                # corrupt file) must trigger a rebuild — never a hard crash.
+                try:
+                    cached = MemoryService.load(self.mem_path)
+                except ValueError as exc:
+                    log.info(
+                        "Alice: cache at %s unreadable (%s) → rebuilding",
+                        self.mem_path,
+                        exc,
+                    )
+                    cached = None
                 # Expect corpus_size working entries + len(pinned_rules) pinned.
                 expected_min = self.corpus_size + len(self.pinned_rules)
-                if len(cached) >= expected_min:
+                if cached is not None and len(cached) >= expected_min:
                     self.memory = cached
                 else:
-                    log.info(
-                        "Alice: cache has %d entries < expected %d → rebuilding",
-                        len(cached),
-                        expected_min,
-                    )
+                    if cached is not None:
+                        log.info(
+                            "Alice: cache has %d entries < expected %d → rebuilding",
+                            len(cached),
+                            expected_min,
+                        )
                     self._build_memory()
             else:
                 self._build_memory()

@@ -110,7 +110,9 @@ def hash_constitution(rules: list[dict] | list[tuple[int, bytes]]) -> str:
     from eth_abi import encode as abi_encode
     from eth_utils import keccak
 
-    encoded = abi_encode(["(uint8,bytes)[]"], [rules])
+    # Solidity Rule is (uint8 kind, bytes params, address adapter) — Phase 5
+    # Stream M. Tuples passed here are expected to already carry the adapter.
+    encoded = abi_encode(["(uint8,bytes,address)[]"], [rules])
     return "0x" + keccak(encoded).hex()
 
 
@@ -212,7 +214,8 @@ class Orchestrator:
             k=5,
             chain_id=self.alice.chain_id,
             asset_address=self.alice.usdc_address,
-            max_amount_usdc=self.alice.price_usdc,
+            expected_price_usdc=self.alice.price_usdc,
+            expected_recipient=self.alice.payment_recipient,
             transport=self.alice.client,
         )
         self.last_query_results = results
@@ -291,7 +294,8 @@ class Orchestrator:
             transport=self.alice.client,
             chain_id=self.alice.chain_id,
             asset_address=self.alice.usdc_address,
-            max_amount_usdc=self.alice.price_usdc,
+            expected_price_usdc=self.alice.price_usdc,
+            expected_recipient=self.alice.payment_recipient,
             trade_size_usdc=oversized,
         )
         self.last_intent = intent

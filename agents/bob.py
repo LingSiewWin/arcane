@@ -36,7 +36,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_utils import keccak
 
-from agents.memory_service import MemoryService, hash_to_vec
+from agents.memory_service import MemoryService, _Entry, hash_to_vec
 from agents.x402_client import x402_query
 
 log = logging.getLogger(__name__)
@@ -73,6 +73,14 @@ SET_LEVERAGE_SELECTOR = bytes.fromhex("79575b23")
 ISSUE_SESSION_KEY_SELECTOR = bytes.fromhex("7873af1d")
 
 USDC_DECIMALS = 6
+
+# Phase 5 Stream M: ConstitutionRegistry.Rule gained an ``address adapter``
+# field (see contracts/src/ConstitutionRegistry.sol). When zero the
+# validator/hook falls back to inline decoding (the MAX_TRADE_SIZE ERC-20
+# fast path). Bob's demo rules carry no custom adapter, so we pin it to the
+# zero address — keeping Bob's locally-computed constitution hash identical
+# to ``ConstitutionRegistry.hashOf`` (keccak256(abi.encode(Rule[]))).
+ZERO_ADAPTER = "0x" + "0" * 40
 
 # Default embedder. Must match Alice's seeder (``agents/seed_alice.py``) so
 # Bob's query vectors land in the same space as the seeded corpus and cosine
@@ -153,18 +161,25 @@ def build_execute_calldata(target: str, value: int, inner: bytes) -> bytes:
     )
 
 
-def rules_to_solidity(rules: list[dict]) -> list[tuple[int, bytes]]:
-    """Convert Bob's Python rule dicts to Solidity ``(uint8 kind, bytes params)``
-    tuples — the shape ``ConstitutionRegistry.defineConstitution`` accepts.
+def rules_to_solidity(rules: list[dict]) -> list[tuple[int, bytes, str]]:
+    """Convert Bob's Python rule dicts to Solidity
+    ``(uint8 kind, bytes params, address adapter)`` tuples — the shape
+    ``ConstitutionRegistry.defineConstitution`` accepts since the Phase 5
+    Stream M ``adapter`` field was added.
+
+    A rule's ``adapter`` defaults to the zero address (inline decoding); a
+    rule dict may override it via an ``adapter`` key for a custom
+    ``IRuleAdapter`` deployment.
     """
-    out: list[tuple[int, bytes]] = []
+    out: list[tuple[int, bytes, str]] = []
     for r in rules:
         kind_label = r["kind"]
         kind_int = _KIND_STR_TO_INT.get(kind_label)
         if kind_int is None:
             raise ValueError(f"unknown rule kind: {kind_label!r}")
         params = _encode_rule_params(kind_label, r)
-        out.append((kind_int, params))
+        adapter = r.get("adapter", ZERO_ADAPTER)
+        out.append((kind_int, params, adapter))
     return out
 
 
@@ -194,10 +209,11 @@ def _encode_rule_params(kind: str, rule: dict) -> bytes:
 def constitution_hash(rules: list[dict]) -> str:
     """``keccak256(abi.encode(Rule[]))`` — matches ``ConstitutionRegistry.hashOf``.
 
-    Encoded form matches Solidity's ``struct Rule { uint8 kind; bytes params; }``.
+    Encoded form matches Solidity's
+    ``struct Rule { uint8 kind; bytes params; address adapter; }``.
     """
     sol_rules = rules_to_solidity(rules)
-    encoded = abi_encode(["(uint8,bytes)[]"], [sol_rules])
+    encoded = abi_encode(["(uint8,bytes,address)[]"], [sol_rules])
     return "0x" + keccak(encoded).hex()
 
 
@@ -303,15 +319,23 @@ class Bob:
         k: int = 5,
         chain_id: int = 5042002,
         asset_address: str = "0x3600000000000000000000000000000000000000",
-        max_amount_usdc: str = "0.001",
+        expected_price_usdc: str = "0.001",
+        expected_recipient: Optional[str] = None,
         transport=None,
     ) -> list[dict]:
-        """Pay 0.001 USDC and ask Alice for top-k matches.
+        """Pay ``expected_price_usdc`` USDC and ask Alice for top-k matches.
 
         ``transport`` is forwarded to ``x402_client.x402_query`` — pass a
         ``fastapi.testclient.TestClient`` for in-process tests, ``None`` for
         real network.  When transport is supplied, the path component is
         appended to make the relative URL.
+
+        Phase 4 audit (B6 / N6 / P1 #8): ``expected_recipient`` is
+        forwarded so the client refuses to sign for any server that
+        rewrites ``payTo``. ``expected_price_usdc`` is a STRICT upper
+        bound on the server's quoted ``maxAmountRequired``. Callers
+        SHOULD pass ``expected_recipient`` in production — F11's
+        recipient pinning is dead code without it.
         """
         if self.eoa is None:
             raise RuntimeError("Bob not bootstrapped")
@@ -331,7 +355,8 @@ class Bob:
             signer=self.eoa,
             chain_id=chain_id,
             asset_address=asset_address,
-            max_amount_usdc=max_amount_usdc,
+            expected_price_usdc=expected_price_usdc,
+            expected_recipient=expected_recipient,
             transport=transport,
         )
 
@@ -345,7 +370,8 @@ class Bob:
         k: int = 5,
         chain_id: int = 5042002,
         asset_address: str = "0x3600000000000000000000000000000000000000",
-        max_amount_usdc: str = "0.001",
+        expected_price_usdc: str = "0.001",
+        expected_recipient: Optional[str] = None,
         transport=None,
         trade_size_usdc: Optional[float] = None,
     ) -> TradeIntent:
@@ -369,7 +395,8 @@ class Bob:
             k=k,
             chain_id=chain_id,
             asset_address=asset_address,
-            max_amount_usdc=max_amount_usdc,
+            expected_price_usdc=expected_price_usdc,
+            expected_recipient=expected_recipient,
             transport=transport,
         )
         if not results:
@@ -500,17 +527,54 @@ class Bob:
             payload={"text": text, "parsed": parsed, "ts": int(time.time())},
         )
 
+    # Phase 5 Stream D (B10) — default number of WORKING entries to clone
+    # from parent → child. The mandate calls for "the top-K most-recent +
+    # most-frequently-retrieved working entries (use the ``weight`` field
+    # as a proxy for relevance)." The MemoryService weight is exp-decayed
+    # since each entry's last decay tick — recent inserts have weight ~1.0,
+    # older entries have decayed. So sorting by ``weight`` descending
+    # surfaces both recency AND retained-relevance (entries promoted via
+    # ``decay_step`` resets) without us needing to track retrieval counts.
+    DEFAULT_CHILD_WORKING_CAP: int = 64
+
     def spawn_child(
         self,
         *,
         child_budget_usdc: Optional[float] = None,
         extra_rules: Optional[list[dict]] = None,
+        memory_working_cap: Optional[int] = None,
     ) -> "Bob":
-        """Spawn a child agent with a sub-budget + inherited constitution.
+        """Spawn a child agent with budget + constitution + parent's memory.
 
-        Real ERC-7715 session-key issuance is Slice 5C; here we just
-        materialise the child Python object so the demo step 6 has
-        something concrete to point at.
+        Phase 5 Stream D (B10): the child inherits a deep-cloned slice of
+        the parent's ``MemoryService``:
+
+          * ALL pinned entries (the constitution) — bit-identical so the
+            child's ``pinned_merkle_root()`` matches the parent's.
+          * Top-``memory_working_cap`` non-pinned entries by ``weight``
+            descending — the parent's "freshest / most-recently-retrieved"
+            traces. Default cap is :attr:`DEFAULT_CHILD_WORKING_CAP`.
+
+        Because the child's ``MemoryService`` reuses the parent's
+        ``(dim, seed)`` rotation and ``_centroid``, every entry is copied
+        verbatim (``bits_packed`` + ``l1`` are bit-identical), so a
+        cosine query against the same vector returns the same top hit on
+        parent and child.
+
+        Real ERC-7715 session-key issuance is Slice 5C; here we
+        materialise the child Python object plus its inherited memory so
+        the demo step 6 can prove "tradable cognition" — the child can
+        answer queries the parent already learned about, without paying
+        Alice again.
+
+        Args:
+            child_budget_usdc: child's USDC budget (≤ parent's).
+            extra_rules: additional constitution rules appended to the
+                parent's set. The child's overall hash will differ from
+                the parent's if any extras are provided.
+            memory_working_cap: how many non-pinned entries to inherit.
+                Defaults to :attr:`DEFAULT_CHILD_WORKING_CAP`. Pass 0
+                to inherit ONLY the constitution (legacy behaviour).
         """
         if self.eoa is None:
             raise RuntimeError("Bob not bootstrapped")
@@ -532,10 +596,124 @@ class Bob:
             constitution_rules=child_rules,
             embedding_model=self.embedding_model,
             embedding_dim=self.embedding_dim,
-            seed=self.seed + 1,
+            # Reuse the parent's seed so the child's MemoryService rotation
+            # matrix matches — that's what makes the verbatim entry copy
+            # valid. ``bootstrap()`` constructs the child's MemoryService
+            # with this seed; we then replace its empty entries dict with
+            # the parent's cloned slice.
+            seed=self.seed,
         )
+        # bootstrap() will create the child's EOA, hash its (extended)
+        # constitution, and build an EMPTY MemoryService seeded only with
+        # the constitution rules. We then OVERWRITE that empty memory
+        # with the parent's cloned state below.
         child.bootstrap()
+
+        # Replace the freshly-built child memory with a deep clone of
+        # the parent's. Doing this AFTER bootstrap() means the child has
+        # a real EOA + constitution hash, and only the memory contents
+        # are inherited.
+        cap = (
+            memory_working_cap
+            if memory_working_cap is not None
+            else self.DEFAULT_CHILD_WORKING_CAP
+        )
+        child.memory = self._clone_memory_for_child(working_cap=cap)
+        # If the child's constitution differs from the parent's (extra
+        # rules), pin the child's extra rules so their constitution
+        # canonicalisation survives. ALL of the parent's pinned entries
+        # are already in the cloned memory; only the brand-new extra
+        # rules need pinning on the child side.
+        for r in (extra_rules or []):
+            text = _rule_canonical_text(r)
+            vec = hash_to_vec(text, dim=self.embedding_dim, seed=self.seed)
+            child.memory.add(
+                trace_id=f"pinned:{r.get('rule_id', r['kind'])}",
+                vec=vec,
+                kind="pinned",
+                pinned=True,
+                payload={"text": text, **r},
+            )
         return child
+
+    def _clone_memory_for_child(self, *, working_cap: int) -> MemoryService:
+        """Deep-clone this Bob's MemoryService for an outgoing child.
+
+        Pinned entries are ALL copied (the constitution must transfer
+        intact — that's the F10 / spec §6 contract). Non-pinned entries
+        are filtered to the top ``working_cap`` by ``weight`` descending
+        — newer / more-recently-retrieved entries first.
+
+        Entries are copied byte-for-byte via the dataclass ``_Entry``
+        constructor — ``bits_packed`` (and the ``l1`` scalar) are passed
+        through with ``.copy()`` so the child can mutate its weights
+        (decay, eviction) without disturbing the parent.
+
+        Returns the new MemoryService. The caller assigns it to
+        ``child.memory``.
+        """
+        if self.memory is None:
+            raise RuntimeError("Bob not bootstrapped — no memory to clone")
+        parent_mem = self.memory
+
+        # Construct child MemoryService with parent's seed so rotation
+        # matrices match. The decay_lambdas dict is copied so child
+        # decay schedules are independent of parent's.
+        child_mem = MemoryService(
+            dim=parent_mem.dim,
+            decay_lambdas=dict(parent_mem.decay_lambdas),
+            seed=parent_mem.seed,
+        )
+        # Set the centroid BEFORE any add. We assign directly because
+        # ``set_centroid`` would raise if there were existing entries;
+        # there aren't, but doing this manually skips an unnecessary
+        # validation hop and makes the intent explicit.
+        if parent_mem._centroid is not None:
+            child_mem._centroid = parent_mem._centroid.copy()
+        # else: leave as None — child will arm zero on first add (if any).
+
+        # Pinned entries — copy ALL of them verbatim.
+        for tid, e in parent_mem.entries.items():
+            if e.pinned:
+                child_mem.entries[tid] = _Entry(
+                    trace_id=e.trace_id,
+                    kind=e.kind,
+                    pinned=True,
+                    payload=dict(e.payload),
+                    bits_packed=e.bits_packed.copy(),
+                    l1=e.l1,
+                    norm=e.norm,
+                    weight=e.weight,
+                    last_decay_ts=e.last_decay_ts,
+                )
+
+        # Working entries — sort by weight DESCENDING, take top N.
+        # ``weight`` proxies relevance: recently-added or recently-promoted
+        # entries have weight near 1.0; long-decayed entries trend toward
+        # the eviction threshold. This is the mandate's "top-K most-recent
+        # + most-frequently-retrieved" surface, no separate retrieval
+        # counter required.
+        working = [e for e in parent_mem.entries.values() if not e.pinned]
+        # Sort: weight desc, then last_decay_ts desc (recency tie-break),
+        # then trace_id asc (deterministic final tie-break).
+        working.sort(
+            key=lambda e: (-e.weight, -e.last_decay_ts, e.trace_id),
+        )
+        if working_cap > 0:
+            for e in working[:working_cap]:
+                child_mem.entries[e.trace_id] = _Entry(
+                    trace_id=e.trace_id,
+                    kind=e.kind,
+                    pinned=False,
+                    payload=dict(e.payload),
+                    bits_packed=e.bits_packed.copy(),
+                    l1=e.l1,
+                    norm=e.norm,
+                    weight=e.weight,
+                    last_decay_ts=e.last_decay_ts,
+                )
+
+        return child_mem
 
 
 # ---------------------------------------------------------------------------

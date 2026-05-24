@@ -230,6 +230,42 @@ class QueryBody(BaseModel):
     k: int = Field(10, ge=1, le=100, description="Top-k.")
 
 
+class AddBody(BaseModel):
+    """Client request body for /add.
+
+    Phase 5 Stream D (B12) — agents push successful reasoning traces back
+    into the shared dark pool index, making the "hive-mind" claim from
+    docs/research.md actually true (parent agents WRITE, not just READ).
+
+    ``trace_id`` MUST be globally unique within the pool — the server
+    rejects duplicates rather than silently overwriting, so two agents
+    that paid for the same slot don't lose data.
+
+    ``vec`` MUST match the pool's dimensionality (typically 384 for
+    MiniLM). A mismatch returns 400 BEFORE the nonce is consumed — the
+    F5 nonce-burn fix is preserved on this surface too.
+
+    ``payload`` is an arbitrary JSON object stored alongside the vector
+    (e.g. ``{"text": "...", "side": "long", ...}``). The server makes no
+    schema demands beyond JSON-serialisability.
+
+    ``pinned`` is intentionally NOT exposed on this endpoint: paid adds
+    write working entries that decay normally. The pinned slot is
+    reserved for the pool operator's constitution rules.
+    """
+
+    trace_id: str = Field(..., min_length=1, max_length=256)
+    vec: list[float] = Field(..., description="Pre-computed embedding.")
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Free-form JSON payload stored with the entry.",
+    )
+    kind: str = Field(
+        default="working",
+        description="One of working/episodic/semantic.",
+    )
+
+
 # --- Server -----------------------------------------------------------------
 
 
@@ -271,6 +307,14 @@ class DarkPoolServer:
         memory: MemoryService,
         *,
         price_per_query_usdc: float | str | Decimal = "0.001",
+        # Phase 5 Stream D (B12) — paid POST /add. Defaults to the same
+        # price as /query so the demo's hive-mind claim works without an
+        # extra config knob. Operators that want a different add price
+        # can set this independently. NOTE: the current ``_validate_payment``
+        # uses ``self.price_units`` for the amount check, so for B12 we
+        # constrain ``price_per_add_usdc`` to match ``price_per_query_usdc``
+        # in practice — a future refactor can split the two paths.
+        price_per_add_usdc: float | str | Decimal | None = None,
         payment_recipient: str,
         arc_chain_id: int = 5042002,
         usdc_address: str = "0x3600000000000000000000000000000000000000",
@@ -290,6 +334,25 @@ class DarkPoolServer:
     ) -> None:
         self.memory = memory
         self.price_units = usdc_to_base_units(price_per_query_usdc)
+        # Phase 5 Stream D (B12) — /add price. ``None`` means "same as
+        # /query". We materialise it as a separate field so the route
+        # handler can advertise the right ``maxAmountRequired`` without
+        # the existing ``_validate_payment`` flow changing shape.
+        self.add_price_units = (
+            usdc_to_base_units(price_per_add_usdc)
+            if price_per_add_usdc is not None
+            else self.price_units
+        )
+        if self.add_price_units != self.price_units:
+            # We share ``_validate_payment`` between /query and /add, and
+            # that helper hard-codes ``self.price_units`` for the amount
+            # gate. Until that helper is split, the two prices must match
+            # or paid adds will be rejected as "insufficient amount".
+            # See B12 implementation notes in this file's docstring.
+            raise NotImplementedError(
+                "split /query and /add prices not yet supported; "
+                "set price_per_add_usdc == price_per_query_usdc"
+            )
         self.payment_recipient = payment_recipient
         self.chain_id = int(arc_chain_id)
         self.usdc_address = usdc_address
@@ -381,6 +444,7 @@ class DarkPoolServer:
                 "ok": True,
                 "memory_entries": len(self.memory),
                 "price_units": self.price_units,
+                "add_price_units": self.add_price_units,
                 "recipient": self.payment_recipient,
                 "asset": self.usdc_address,
                 "chain_id": self.chain_id,
@@ -389,6 +453,13 @@ class DarkPoolServer:
         @self.app.post("/query")
         async def query_route(request: Request) -> Any:
             return await self._handle_query(request)
+
+        # Phase 5 Stream D (B12) — agents push successful reasoning
+        # traces back into the shared index. The "hive-mind dark pool"
+        # claim from docs/research.md requires a write path; this is it.
+        @self.app.post("/add")
+        async def add_route(request: Request) -> Any:
+            return await self._handle_add(request)
 
     # ------------------------------------------------------------------
     # 402 helpers
@@ -480,7 +551,9 @@ class DarkPoolServer:
 
     def _validate_payment(
         self, payment: dict[str, Any]
-    ) -> tuple[bool, str | None, str | None, str | None, int | None]:
+    ) -> tuple[
+        bool, str | None, str | None, str | None, int | None, str | None
+    ]:
         """Validate a parsed X-PAYMENT payload WITHOUT consuming the nonce.
 
         Phase 3 audit (F5): this helper now performs every check it used
@@ -489,25 +562,52 @@ class DarkPoolServer:
         request handler **after** rate-limit / dim-check pass — so a
         rejected request never burns the user's nonce.
 
-        Returns ``(ok, error_msg, signer_lc, nonce_lc, valid_before)``.
-        On failure, the trailing fields may be ``None``. The replay
-        check (``self._nonce_store.has``) is still done here so a known
-        replay returns 402 with ``"nonce replayed"`` immediately —
-        only the **insert** is deferred.
+        Phase 4 audit (B2 / P0-1): the return tuple now includes the
+        ``verifying_contract`` that successfully recovered the signer.
+        That value is the nonce-store partition key — without it, F2's
+        cross-domain replay protection lands in the legacy sentinel
+        domain (a bug, not a feature).
+
+        Returns ``(ok, error_msg, signer_lc, nonce_lc, valid_before,
+        verifying_contract)``. On failure, the trailing fields may be
+        ``None``. The replay check (``self._nonce_store.has``) is still
+        done here so a known replay returns 402 with ``"nonce replayed"``
+        immediately — only the **insert** is deferred.
         """
         if payment.get("scheme") != DEFAULT_SCHEME:
-            return False, f"unsupported scheme: {payment.get('scheme')!r}", None, None, None
+            return (
+                False,
+                f"unsupported scheme: {payment.get('scheme')!r}",
+                None,
+                None,
+                None,
+                None,
+            )
         if payment.get("network") != self.network:
-            return False, f"unsupported network: {payment.get('network')!r}", None, None, None
+            return (
+                False,
+                f"unsupported network: {payment.get('network')!r}",
+                None,
+                None,
+                None,
+                None,
+            )
 
         payload = payment.get("payload")
         if not isinstance(payload, dict):
-            return False, "missing payload", None, None, None
+            return False, "missing payload", None, None, None, None
 
         auth = payload.get("authorization")
         sig = payload.get("signature")
         if not isinstance(auth, dict) or not isinstance(sig, str):
-            return False, "payload missing authorization or signature", None, None, None
+            return (
+                False,
+                "payload missing authorization or signature",
+                None,
+                None,
+                None,
+                None,
+            )
 
         try:
             from_addr = auth["from"]
@@ -517,7 +617,14 @@ class DarkPoolServer:
             valid_before = int(auth["validBefore"])
             nonce_hex = auth["nonce"]
         except (KeyError, TypeError, ValueError) as exc:
-            return False, f"authorization fields invalid: {exc}", None, None, None
+            return (
+                False,
+                f"authorization fields invalid: {exc}",
+                None,
+                None,
+                None,
+                None,
+            )
 
         # Phase 3 audit (F8): explicit zero-address rejection BEFORE we
         # try to recover the signer. ecrecover can synthesise the zero
@@ -525,21 +632,29 @@ class DarkPoolServer:
         # that, but we also reject ``from = 0x000...0`` up-front so a
         # malformed payload with hand-crafted sig fails the cheap check.
         if not isinstance(from_addr, str) or from_addr.lower() == ZERO_ADDRESS:
-            return False, "from address is zero", None, None, None
+            return False, "from address is zero", None, None, None, None
 
         now = int(time.time())
         if valid_before <= now:
-            return False, "authorization expired", None, None, None
+            return False, "authorization expired", None, None, None, None
         if valid_after > now + 5:  # small clock-skew buffer
-            return False, "authorization not yet valid", None, None, None
+            return (
+                False,
+                "authorization not yet valid",
+                None,
+                None,
+                None,
+                None,
+            )
 
         # Recipient + asset + amount checks.
         if to_addr.lower() != self.payment_recipient.lower():
-            return False, "wrong recipient", None, None, None
+            return False, "wrong recipient", None, None, None, None
         if value < self.price_units:
             return (
                 False,
                 f"insufficient amount: got {value}, need {self.price_units}",
+                None,
                 None,
                 None,
                 None,
@@ -553,6 +668,7 @@ class DarkPoolServer:
             return (
                 False,
                 f"excessive amount: got {value}, max {max_value}",
+                None,
                 None,
                 None,
                 None,
@@ -576,6 +692,10 @@ class DarkPoolServer:
             )
 
         recovered: str | None = None
+        # Phase 4 audit (B2 / P0-1) — track which verifyingContract
+        # actually recovered the signer so we can namespace the nonce by
+        # the matching domain (NOT the legacy sentinel).
+        recovered_verifying_contract: str | None = None
         last_err: str | None = None
         for verifying_contract, name, version in candidate_domains:
             typed = build_typed_data(
@@ -597,6 +717,7 @@ class DarkPoolServer:
                 continue
             if candidate.lower() == from_addr.lower():
                 recovered = candidate
+                recovered_verifying_contract = verifying_contract
                 break
 
         if recovered is None:
@@ -606,25 +727,62 @@ class DarkPoolServer:
                 None,
                 None,
                 None,
+                None,
             )
 
         signer_lc = recovered.lower()
         nonce_lc = nonce_hex.lower()
+        # Phase 4 audit (B2 / P0-1) — the (chain_id, verifying_contract)
+        # pair is part of the replay-protection key now. The verifying
+        # contract we recovered against tells us which EIP-712 domain
+        # signed the auth; that domain's address is the nonce-store
+        # partition key. Net effect: a signature replayed across chains
+        # or across token contracts is detected as a fresh nonce, not
+        # silently accepted.
+        # Recovery succeeded — by construction ``recovered`` and
+        # ``recovered_verifying_contract`` are both set above. Use the
+        # actual domain that matched the signature.
+        assert recovered_verifying_contract is not None
+        domain_verifying_contract = recovered_verifying_contract
         # Replay protection — read-only check here. The actual
         # ``add()`` is deferred to ``_commit_nonce`` so that a 400 or
         # 429 farther down the handler doesn't burn a fresh nonce.
         # We still hold the lock briefly so a concurrent commit_nonce
         # can't slip a duplicate past us between has() and the return.
         with self._nonce_lock:
-            if self._nonce_store.has(signer_lc, nonce_lc):
-                return False, "nonce replayed", signer_lc, nonce_lc, valid_before
+            if self._nonce_store.has(
+                signer_lc,
+                nonce_lc,
+                chain_id=self.chain_id,
+                verifying_contract=domain_verifying_contract,
+            ):
+                return (
+                    False,
+                    "nonce replayed",
+                    signer_lc,
+                    nonce_lc,
+                    valid_before,
+                    domain_verifying_contract,
+                )
 
-        return True, None, signer_lc, nonce_lc, valid_before
+        return (
+            True,
+            None,
+            signer_lc,
+            nonce_lc,
+            valid_before,
+            domain_verifying_contract,
+        )
 
     def _commit_nonce(
-        self, signer_lc: str, nonce_lc: str, valid_before: int
+        self,
+        signer_lc: str,
+        nonce_lc: str,
+        valid_before: int,
+        *,
+        verifying_contract: str,
     ) -> tuple[bool, str | None]:
-        """Atomic check-and-insert for a (signer, nonce).
+        """Atomic check-and-insert for a (chain_id, verifying_contract, signer, nonce).
 
         Phase 3 audit (F5): callers MUST invoke this only after every
         other check has passed (rate-limit + dim-check). On the rare
@@ -632,12 +790,28 @@ class DarkPoolServer:
         slip past the ``has()`` in ``_validate_payment``, the second
         one trips the duplicate-detection here and is rejected.
 
+        Phase 4 audit (B2 / P0-1): ``chain_id`` and ``verifying_contract``
+        are now required so the row lands in the proper namespaced
+        domain (NOT the legacy sentinel). Without this, F2's cross-domain
+        protection would be theatre.
+
         Returns ``(ok, err)``.
         """
         with self._nonce_lock:
-            if self._nonce_store.has(signer_lc, nonce_lc):
+            if self._nonce_store.has(
+                signer_lc,
+                nonce_lc,
+                chain_id=self.chain_id,
+                verifying_contract=verifying_contract,
+            ):
                 return False, "nonce replayed"
-            self._nonce_store.add(signer_lc, nonce_lc, expires_at=valid_before)
+            self._nonce_store.add(
+                signer_lc,
+                nonce_lc,
+                expires_at=valid_before,
+                chain_id=self.chain_id,
+                verifying_contract=verifying_contract,
+            )
         return True, None
 
     # ------------------------------------------------------------------
@@ -694,7 +868,14 @@ class DarkPoolServer:
         except ValueError as exc:
             return self._make_402(resource, error=str(exc))
 
-        ok, err, signer, nonce_lc, valid_before = self._validate_payment(payment)
+        (
+            ok,
+            err,
+            signer,
+            nonce_lc,
+            valid_before,
+            verifying_contract,
+        ) = self._validate_payment(payment)
         if not ok:
             return self._make_402(resource, error=err)
 
@@ -707,8 +888,11 @@ class DarkPoolServer:
         assert signer is not None  # invariant after ok=True
         assert nonce_lc is not None
         assert valid_before is not None
-        if not self._rate_limiter.try_consume(signer):
-            retry_after = self._rate_limiter.retry_after(signer)
+        assert verifying_contract is not None
+        # Phase 5 Stream D (B14): rate limiter API is now async-aware so we
+        # don't park the event loop on a kernel mutex inside this handler.
+        if not await self._rate_limiter.try_consume(signer):
+            retry_after = await self._rate_limiter.retry_after(signer)
             # Round up to whole seconds for the header per RFC 7231.
             ra_int = max(1, int(retry_after) + (1 if retry_after % 1 else 0))
             return JSONResponse(
@@ -724,7 +908,15 @@ class DarkPoolServer:
         # 6. Phase 3 audit (F5): NOW commit the nonce atomically. If a
         #    concurrent request raced past our earlier has() and inserted
         #    the same nonce in between, we surface that as 402 replayed.
-        ok_commit, err_commit = self._commit_nonce(signer, nonce_lc, valid_before)
+        #
+        # Phase 4 audit (B2 / P0-1): pass the EIP-712 domain so the nonce
+        # lands in the namespaced partition (NOT the legacy sentinel).
+        ok_commit, err_commit = self._commit_nonce(
+            signer,
+            nonce_lc,
+            valid_before,
+            verifying_contract=verifying_contract,
+        )
         if not ok_commit:
             return self._make_402(resource, error=err_commit)
 
@@ -743,10 +935,188 @@ class DarkPoolServer:
             })
         return JSONResponse(status_code=200, content={"results": out})
 
+    # ------------------------------------------------------------------
+    # Phase 5 Stream D (B12) — paid POST /add: hive-mind write path.
+    # ------------------------------------------------------------------
+
+    async def _handle_add(self, request: Request) -> Any:
+        """Paid write into the dark pool's MemoryService.
+
+        Mirrors :meth:`_handle_query`'s validation order so the F5
+        "don't burn the nonce on early failures" invariant holds on
+        this path too:
+
+          1. Parse JSON body. Bad JSON → 400.
+          2. Validate ``AddBody`` shape. Missing fields → 400.
+          3. Validate vector dimensionality. Wrong dim → 400 BEFORE
+             nonce commit (B12 test d).
+          4. Verify ``X-PAYMENT`` header. Missing → 402.
+          5. Validate signature, recipient, amount, replay-check
+             (read-only). Bad → 402.
+          6. Per-signer rate limit. Over budget → 429.
+          7. Commit nonce. Race-lost → 402.
+          8. Insert into MemoryService.
+
+        F11 (server-side recipient enforcement) is inherited from
+        ``_validate_payment``'s ``to_addr.lower() != self.payment_recipient``
+        check — a client signing for the wrong recipient is refused
+        on /add for the same reason as /query.
+
+        Pinned status is forced to False — paid adds write working
+        entries that decay. Pinning is reserved for the operator.
+        """
+        resource = str(request.url.path)
+
+        # 1. Parse JSON body.
+        try:
+            body_json = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "request body must be JSON"},
+            )
+
+        # 2. Validate AddBody shape.
+        try:
+            body = AddBody(**body_json)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"invalid body: {exc}"},
+            )
+
+        # 3. Vector dimensionality check — BEFORE payment so a typo'd
+        #    vector doesn't burn a fresh nonce (B12 test d / F5 invariant).
+        vec = np.asarray(body.vec, dtype=np.float32)
+        if vec.shape != (self.memory.dim,):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        f"vec must be length {self.memory.dim}, "
+                        f"got {vec.shape}"
+                    )
+                },
+            )
+
+        # Kind must be a valid working-style kind. We refuse "pinned"
+        # on this endpoint — pinned slots belong to the pool operator.
+        if body.kind not in ("working", "episodic", "semantic"):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        f"kind must be one of working/episodic/semantic, "
+                        f"got {body.kind!r}"
+                    )
+                },
+            )
+
+        # 4. Payment required.
+        payment_header = request.headers.get("X-PAYMENT")
+        if not payment_header:
+            return self._make_402(resource)
+
+        # 5. Decode + validate (signature, recipient, amount, replay-check).
+        try:
+            payment = self._parse_payment_header(payment_header)
+        except ValueError as exc:
+            return self._make_402(resource, error=str(exc))
+
+        (
+            ok,
+            err,
+            signer,
+            nonce_lc,
+            valid_before,
+            verifying_contract,
+        ) = self._validate_payment(payment)
+        if not ok:
+            return self._make_402(resource, error=err)
+
+        assert signer is not None
+        assert nonce_lc is not None
+        assert valid_before is not None
+        assert verifying_contract is not None
+
+        # 6. Per-signer rate limit (async; no event-loop block per B14).
+        if not await self._rate_limiter.try_consume(signer):
+            retry_after = await self._rate_limiter.retry_after(signer)
+            ra_int = max(1, int(retry_after) + (1 if retry_after % 1 else 0))
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "rate limit exceeded",
+                    "signer": signer,
+                    "retry_after_seconds": retry_after,
+                },
+                headers={"Retry-After": str(ra_int)},
+            )
+
+        # 7. Reject duplicate trace_id BEFORE we commit the nonce so a
+        #    client can retry with a fresh trace_id and the same auth
+        #    (per the F5 don't-burn-on-recoverable-failure invariant).
+        if body.trace_id in self.memory.entries:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": f"trace_id already exists: {body.trace_id!r}",
+                },
+            )
+
+        # 8. Commit nonce (atomic check-and-insert).
+        ok_commit, err_commit = self._commit_nonce(
+            signer,
+            nonce_lc,
+            valid_before,
+            verifying_contract=verifying_contract,
+        )
+        if not ok_commit:
+            return self._make_402(resource, error=err_commit)
+
+        # 9. Insert into the MemoryService. Pinned forced to False —
+        #    paid adds write working entries that decay normally.
+        try:
+            self.memory.add(
+                trace_id=body.trace_id,
+                vec=vec,
+                kind=body.kind,
+                pinned=False,
+                payload=dict(body.payload),
+            )
+        except ValueError as exc:
+            # The shape check above should catch dim mismatch; this
+            # branch handles any future MemoryService validation
+            # error (e.g. invalid kind) without leaking internals.
+            logger.exception("memory.add raised for trace_id=%s", body.trace_id)
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"memory.add rejected entry: {exc}"},
+            )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "trace_id": body.trace_id,
+                "memory_entries": len(self.memory),
+                "signer": signer,
+            },
+        )
+
 
 # --- Module-level app object for ``uvicorn agents.dark_pool:app`` -----------
 
-_DEFAULT_RECIPIENT = "0x0000000000000000000000000000000000000000"
+
+class DarkPoolMisconfigured(RuntimeError):
+    """Raised on startup if the operator forgot to set DARKPOOL_RECIPIENT.
+
+    Phase 4 audit (B4 / P0-4): the previous build hard-coded a
+    ``_DEFAULT_RECIPIENT = "0x0000000000000000000000000000000000000000"``
+    fallback. An operator who forgot to set the env var would silently
+    accept signed USDC transfers to the zero address — funds burned,
+    looked like a working server. We now refuse to start.
+    """
 
 
 def _build_default_app() -> FastAPI:
@@ -762,8 +1132,34 @@ def _build_default_app() -> FastAPI:
     crash on a fresh box (the file is created by ``agents/seed_alice.py``
     which itself imports agents code), so every consumer had to pre-touch
     a placeholder. Now imports are side-effect-free.
+
+    Phase 4 audit (B4 / P0-4): refuse to start if ``DARKPOOL_RECIPIENT``
+    is unset, empty, or equals the zero address. A server that accepts
+    payments to ``0x0`` is a footgun: the signatures will validate, the
+    nonce store will mark them as consumed, and the demo "succeeds" with
+    burned funds. We surface the misconfiguration loudly at startup
+    instead of letting the first paid query silently dispose of the
+    user's USDC.
     """
-    recipient = os.environ.get("DARKPOOL_RECIPIENT", _DEFAULT_RECIPIENT)
+    recipient = os.environ.get("DARKPOOL_RECIPIENT", "").strip()
+    if not recipient or recipient.lower() == ZERO_ADDRESS:
+        raise DarkPoolMisconfigured(
+            "DARKPOOL_RECIPIENT is unset or equals the zero address — refusing "
+            "to start. Set DARKPOOL_RECIPIENT to a non-zero EOA / SCA owned by "
+            "the dark pool operator before launching `uvicorn agents.dark_pool:app`. "
+            "Without this guard, every signed USDC transfer is directed at the "
+            "burn address (Phase 4 audit B4 / P0-4)."
+        )
+    # Light sanity check: well-formed 0x-prefixed 20-byte address.
+    if not (
+        recipient.startswith("0x")
+        and len(recipient) == 42
+        and all(c in "0123456789abcdefABCDEF" for c in recipient[2:])
+    ):
+        raise DarkPoolMisconfigured(
+            f"DARKPOOL_RECIPIENT {recipient!r} is not a valid 0x-prefixed "
+            f"20-byte hex address. Refusing to start."
+        )
     mem_path = os.environ.get("DARKPOOL_MEMORY_PATH", "/tmp/alice.mem")
     mem = MemoryService.load(mem_path)
     server = DarkPoolServer(

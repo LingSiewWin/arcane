@@ -9,6 +9,14 @@ Phase-3 F2 hardening — nonce identity is now namespaced by
 issued under one EIP-712 domain cannot be replayed under a different
 domain (e.g. a different chain or a different token contract).
 
+Phase-4 B2 / P0-1 hardening — the legacy 2-arg ``has(signer, nonce)`` /
+``add(signer, nonce, expires_at)`` calling convention is now a HARD
+ERROR (``ValueError``), not a silent fallback to the sentinel domain.
+The audit found that the only in-tree consumer (``dark_pool.py``) was
+calling the 2-arg form, silently parking every nonce in the legacy
+sentinel domain and defeating F2's cross-domain protection entirely.
+Refusing the call at the API boundary makes the bug impossible to ship.
+
 Two implementations are provided:
 
 * ``SqliteNonceStore(path)`` — real sqlite3 file, WAL mode for concurrent
@@ -19,12 +27,6 @@ Two implementations are provided:
 
 Both implement the same ``NonceStore`` Protocol so the dark pool can swap
 between them at construction time.
-
-Backward compatibility: callers that pass only ``(signer, nonce)`` are
-mapped into a sentinel legacy domain ``(0, "0x0...0")`` and a
-``DeprecationWarning`` is emitted. The legacy domain is its own
-namespace — rows written there can never collide with a real chain's
-rows.
 """
 
 from __future__ import annotations
@@ -33,16 +35,16 @@ import os
 import sqlite3
 import sys
 import threading
-import warnings
 from typing import Protocol, runtime_checkable
 
 
 _SCHEMA_VERSION = 2
 
-# Sentinel domain used when callers don't provide chain_id /
-# verifying_contract. The (chain_id=0, verifying_contract=0x0..0) pair is
-# disjoint from any real EIP-712 domain because legitimate domains have
-# non-zero chain IDs and non-zero contract addresses.
+# Sentinel domain — retained ONLY as a recognised partition key for
+# tests that want to probe the legacy slot directly via the kwargs.
+# Callers are no longer allowed to FALL BACK to this domain by omitting
+# the kwargs; they must pass an explicit ``chain_id=0,
+# verifying_contract="0x000…0"`` to opt in.
 _LEGACY_CHAIN_ID = 0
 _LEGACY_VERIFYING_CONTRACT = "0x" + "0" * 40
 
@@ -101,30 +103,28 @@ def _normalise(signer: str, nonce: str) -> tuple[str, str]:
     return signer.lower(), nonce.lower()
 
 
-def _warn_legacy() -> None:
-    """Emit a DeprecationWarning for callers using the 2-arg form."""
-    warnings.warn(
-        "NonceStore.has/.add called without (chain_id, verifying_contract); "
-        "rows will be stored under the legacy sentinel domain. Update callers "
-        "to pass the EIP-712 domain to prevent cross-domain replay.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-
-
 def _resolve_domain(
     chain_id: int | None,
     verifying_contract: str | None,
-) -> tuple[int, str, bool]:
+) -> tuple[int, str]:
     """Resolve (chain_id, verifying_contract) to a stored domain key.
 
-    Returns ``(resolved_chain_id, resolved_verifying_contract_lc, used_legacy)``.
+    Phase 4 audit (B2 / P0-1): callers MUST pass both ``chain_id`` and
+    ``verifying_contract``. Omitting either side previously silently
+    parked the row in the sentinel legacy domain, which broke F2's
+    cross-domain replay protection at the consumer. We now raise so
+    such bugs surface immediately at the API boundary.
+
+    Returns ``(resolved_chain_id, resolved_verifying_contract_lc)``.
     """
-    used_legacy = False
     if chain_id is None or verifying_contract is None:
-        used_legacy = True
-        return _LEGACY_CHAIN_ID, _LEGACY_VERIFYING_CONTRACT, used_legacy
-    return int(chain_id), str(verifying_contract).lower(), used_legacy
+        raise ValueError(
+            "NonceStore.has/.add require both chain_id and verifying_contract; "
+            "the legacy 2-arg form was removed in Phase-4 to make F2's "
+            "cross-domain replay protection impossible to bypass at the "
+            "consumer. Update the caller to pass the EIP-712 domain."
+        )
+    return int(chain_id), str(verifying_contract).lower()
 
 
 class SqliteNonceStore:
@@ -252,9 +252,7 @@ class SqliteNonceStore:
         chain_id: int | None = None,
         verifying_contract: str | None = None,
     ) -> bool:
-        cid, vc, used_legacy = _resolve_domain(chain_id, verifying_contract)
-        if used_legacy:
-            _warn_legacy()
+        cid, vc = _resolve_domain(chain_id, verifying_contract)
         s, n = _normalise(signer, nonce)
         with self._lock:
             cur = self._conn.execute(
@@ -273,9 +271,7 @@ class SqliteNonceStore:
         chain_id: int | None = None,
         verifying_contract: str | None = None,
     ) -> None:
-        cid, vc, used_legacy = _resolve_domain(chain_id, verifying_contract)
-        if used_legacy:
-            _warn_legacy()
+        cid, vc = _resolve_domain(chain_id, verifying_contract)
         s, n = _normalise(signer, nonce)
         with self._lock:
             # INSERT OR IGNORE so concurrent inserts of the same nonce
@@ -336,9 +332,7 @@ class InMemoryNonceStore:
         chain_id: int | None = None,
         verifying_contract: str | None = None,
     ) -> bool:
-        cid, vc, used_legacy = _resolve_domain(chain_id, verifying_contract)
-        if used_legacy:
-            _warn_legacy()
+        cid, vc = _resolve_domain(chain_id, verifying_contract)
         s, n = _normalise(signer, nonce)
         key = (cid, vc, s, n)
         with self._lock:
@@ -352,9 +346,7 @@ class InMemoryNonceStore:
         chain_id: int | None = None,
         verifying_contract: str | None = None,
     ) -> None:
-        cid, vc, used_legacy = _resolve_domain(chain_id, verifying_contract)
-        if used_legacy:
-            _warn_legacy()
+        cid, vc = _resolve_domain(chain_id, verifying_contract)
         s, n = _normalise(signer, nonce)
         key = (cid, vc, s, n)
         with self._lock:

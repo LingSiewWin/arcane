@@ -180,12 +180,13 @@ def test_bob_bootstrap_creates_eoa_and_constitution(fresh_bob: Bob):
     recovered = Account.recover_message(msg, signature=sig.signature)
     assert recovered == addr
 
-    # Constitution hash matches manual keccak.
+    # Constitution hash matches manual keccak. Rule is
+    # (uint8 kind, bytes params, address adapter) — Phase 5 Stream M.
     sol_rules = rules_to_solidity(fresh_bob.constitution_rules)
     from eth_abi import encode as abi_encode
 
     expected = "0x" + keccak(
-        abi_encode(["(uint8,bytes)[]"], [sol_rules])
+        abi_encode(["(uint8,bytes,address)[]"], [sol_rules])
     ).hex()
     assert fresh_bob.constitution_hash == expected
 
@@ -217,7 +218,8 @@ def test_bob_decides_uses_real_x402_round_trip(small_alice: Alice):
         transport=small_alice.client,
         chain_id=small_alice.chain_id,
         asset_address=small_alice.usdc_address,
-        max_amount_usdc=small_alice.price_usdc,
+        expected_price_usdc=small_alice.price_usdc,
+        expected_recipient=small_alice.payment_recipient,
         trade_size_usdc=5.0,  # 5x the 1 USDC cap — guaranteed violator
     )
 
@@ -298,7 +300,8 @@ def test_constitution_calldata_uses_real_selectors(small_alice: Alice):
         transport=small_alice.client,
         chain_id=small_alice.chain_id,
         asset_address=small_alice.usdc_address,
-        max_amount_usdc=small_alice.price_usdc,
+        expected_price_usdc=small_alice.price_usdc,
+        expected_recipient=small_alice.payment_recipient,
         trade_size_usdc=5.0,
     )
 
@@ -403,7 +406,8 @@ def test_bob_defaults_to_minilm_and_retrieves_templated_trace(small_alice: Alice
         k=5,
         chain_id=small_alice.chain_id,
         asset_address=small_alice.usdc_address,
-        max_amount_usdc=small_alice.price_usdc,
+        expected_price_usdc=small_alice.price_usdc,
+        expected_recipient=small_alice.payment_recipient,
         transport=small_alice.client,
     )
     assert results, "dark pool returned no results"

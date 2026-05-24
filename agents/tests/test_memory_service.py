@@ -199,14 +199,13 @@ def test_save_load_roundtrip():
         assert abs(s_a - s_b) < 1e-5, f"score mismatch {s_a} vs {s_b}"
 
 
-def test_rerank_improves_recall():
-    """The FP32 rerank pass must lift recall@10 by ≥20 pts vs the raw binary
-    scan on random data.
-
-    We measure recall against brute-force FP32 ground truth. The "binary
-    only" baseline is computed inline so we don't have to expose rerank as a
-    public toggle (the service always reranks; this test does its own raw
-    binary calc for the comparison).
+def test_estimator_not_worse_than_raw_popcount():
+    """The RaBitQ unbiased estimator (production query, no FP32) must be at
+    least as accurate as the raw popcount baseline — the l1 calibration is
+    free and never hurts ranking. We compare both against brute-force FP32
+    ground truth. (Random near-orthogonal vectors are a worst case for
+    quantization recall; real clustered text does materially better — see
+    bench/measure_memory_efficiency.py.)
     """
     dim = 384
     n = 500
@@ -218,17 +217,15 @@ def test_rerank_improves_recall():
     for i, v in enumerate(vectors):
         mem.add(trace_id=f"v{i:04d}", vec=v, kind="working")
 
-    # --- With rerank (the production path) ---
-    recall_rerank = 0.0
+    # --- Estimator (the production query path) ---
+    recall_est = 0.0
     for q in queries:
         gt = set(_ground_truth_topk(vectors, q, k))
-        pred_ids = [tid for tid, _ in mem.query(vec=q, k=k)]
-        pred = {int(tid[1:]) for tid in pred_ids}  # strip "v" prefix
-        recall_rerank += len(gt & pred) / k
-    recall_rerank /= len(queries)
+        pred = {int(tid[1:]) for tid, _ in mem.query(vec=q, k=k)}
+        recall_est += len(gt & pred) / k
+    recall_est /= len(queries)
 
-    # --- Raw binary baseline: reimplement the binary scan without rerank ---
-    # We poke into the entries to score; this mirrors the bench impl exactly.
+    # --- Raw popcount baseline (no l1 calibration) ---
     from agents.memory_service import _SIGNS_MASK  # type: ignore
 
     ids = list(mem.entries.keys())
@@ -236,11 +233,11 @@ def test_rerank_improves_recall():
     n_bytes = bits_matrix.shape[1]
     d_padded = n_bytes * 8
 
-    recall_binary = 0.0
+    recall_raw = 0.0
     for q in queries:
-        q_unit_rot, _, _ = mem._encode(q)
+        q_rot, _b, _l1, _nrm = mem._encode(q)
         r_q_padded = np.zeros(d_padded, dtype=np.float32)
-        r_q_padded[: dim] = q_unit_rot
+        r_q_padded[:dim] = q_rot
         r_q_reshaped = r_q_padded.reshape(n_bytes, 8)
         lookup = r_q_reshaped @ _SIGNS_MASK.T
         contribs = lookup[np.arange(n_bytes), bits_matrix]
@@ -248,17 +245,35 @@ def test_rerank_improves_recall():
         top_idx = np.argsort(-approx)[:k]
         pred = {int(ids[i][1:]) for i in top_idx}
         gt = set(_ground_truth_topk(vectors, q, k))
-        recall_binary += len(gt & pred) / k
-    recall_binary /= len(queries)
+        recall_raw += len(gt & pred) / k
+    recall_raw /= len(queries)
 
-    print(
-        f"\n[rerank test] binary_only={recall_binary:.3f}  "
-        f"with_rerank={recall_rerank:.3f}  lift={recall_rerank - recall_binary:.3f}"
+    print(f"\n[estimator] raw_popcount={recall_raw:.3f}  estimator={recall_est:.3f}")
+    assert recall_est >= recall_raw - 0.02, (
+        f"estimator must not be worse than raw popcount; "
+        f"raw={recall_raw:.3f}, estimator={recall_est:.3f}"
     )
-    assert recall_rerank - recall_binary >= 0.20, (
-        f"FP32 rerank must lift recall@10 by ≥0.20; "
-        f"got binary={recall_binary:.3f}, rerank={recall_rerank:.3f}"
-    )
+    assert recall_est > 0.0
+
+
+def test_memory_is_one_bit_compressed():
+    """The store must be genuinely ~30x smaller than FP32 — the thesis claim.
+    No FP32 vector is retained per entry; only the bit code + scalars."""
+    dim = 384
+    mem = MemoryService(dim=dim, seed=0)
+    for i, v in enumerate(_rand_vecs(64, dim, seed=11)):
+        mem.add(trace_id=f"v{i}", vec=v, kind="working")
+
+    stats = mem.memory_stats()
+    assert stats["bytes_per_vec"] <= 60, stats  # 48 bits + 4 + 4 = 56 at d=384
+    assert stats["fp32_bytes_per_vec"] == dim * 4
+    assert stats["compression_x"] >= 25, stats
+
+    # Hard guarantee: entries carry no FP32 coordinate vector anymore.
+    e = next(iter(mem.entries.values()))
+    assert not hasattr(e, "unit_rot"), "FP32 vector must not be stored per entry"
+    assert e.bits_packed.dtype == np.uint8
+    assert isinstance(e.l1, float)
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +362,8 @@ def test_save_load_roundtrip_100_entries():
         assert abs(e.weight - e2.weight) < 1e-6
         assert abs(e.last_decay_ts - e2.last_decay_ts) < 1e-6
         assert abs(e.norm - e2.norm) < 1e-5
+        assert abs(e.l1 - e2.l1) < 1e-4
         assert np.array_equal(e.bits_packed, e2.bits_packed)
-        assert np.allclose(e.unit_rot, e2.unit_rot, atol=1e-6)
 
     # Query equivalence.
     post_results = mem2.query(vec=q, k=10)
@@ -381,13 +396,13 @@ def test_save_load_rejects_malformed_metadata():
         meta_garbage = np.frombuffer(b"\xff\xfe-not-json-", dtype=np.uint8)
         np.savez_compressed(
             open(path, "wb"),
-            vectors=np.zeros((0, 8), dtype=np.float32),
+            l1s=np.zeros((0,), dtype=np.float32),
             bits_packed=np.zeros((0, 1), dtype=np.uint8),
             weights=np.zeros((0,), dtype=np.float32),
             last_decay_ts=np.zeros((0,), dtype=np.float64),
             norms=np.zeros((0,), dtype=np.float32),
             meta=meta_garbage,
-            version=np.asarray([2], dtype=np.int64),
+            version=np.asarray([3], dtype=np.int64),
         )
         with pytest.raises(ValueError, match="malformed metadata"):
             MemoryService.load(path)

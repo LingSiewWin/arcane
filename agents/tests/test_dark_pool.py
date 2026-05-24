@@ -238,7 +238,7 @@ def test_x402_client_happy_path(client, bob_account, alice_account):
         signer=bob_account,
         chain_id=CHAIN_ID,
         asset_address=USDC,
-        max_amount_usdc=PRICE_USDC,
+        expected_price_usdc=PRICE_USDC,
         transport=client,
     )
     assert isinstance(results, list)
@@ -247,7 +247,7 @@ def test_x402_client_happy_path(client, bob_account, alice_account):
 
 
 def test_x402_client_max_amount_guard(client, bob_account):
-    # Client refuses to pay if the server demands more than max_amount_usdc.
+    # Client refuses to pay if the server quotes more than expected_price_usdc.
     with pytest.raises(X402Error):
         x402_query(
             url="/query",
@@ -256,8 +256,8 @@ def test_x402_client_max_amount_guard(client, bob_account):
             signer=bob_account,
             chain_id=CHAIN_ID,
             asset_address=USDC,
-            # Budget is 1 base-unit below the asking price → no valid accept.
-            max_amount_usdc=Decimal_str_below_price(),
+            # Expected price is below the server's quote → no valid accept.
+            expected_price_usdc=Decimal_str_below_price(),
             transport=client,
         )
 
@@ -277,7 +277,7 @@ def test_x402_client_round_trip_uses_pay_and_post(client, bob_account, alice_acc
         signer=bob_account,
         chain_id=CHAIN_ID,
         asset_address=USDC,
-        max_amount_usdc=PRICE_USDC,
+        expected_price_usdc=PRICE_USDC,
         transport=client,
     )
     assert "results" in resp
@@ -465,9 +465,24 @@ def test_dark_pool_lifespan_purges_and_closes_store(tmp_path, alice_account):
 
     db_path = tmp_path / "lifespan.db"
     store = SqliteNonceStore(str(db_path))
-    # Pre-populate one expired and one fresh nonce.
-    store.add("0xaaaa", "0xexpired", expires_at=1)
-    store.add("0xaaaa", "0xfresh", expires_at=2**31 - 1)
+    # Pre-populate one expired and one fresh nonce. Pass the EIP-712
+    # domain explicitly — Phase-4 hardening removed the legacy 2-arg
+    # form so the dark-pool's F2 cross-domain protection can't be
+    # bypassed by an in-tree caller.
+    store.add(
+        "0xaaaa",
+        "0xexpired",
+        expires_at=1,
+        chain_id=CHAIN_ID,
+        verifying_contract=USDC,
+    )
+    store.add(
+        "0xaaaa",
+        "0xfresh",
+        expires_at=2**31 - 1,
+        chain_id=CHAIN_ID,
+        verifying_contract=USDC,
+    )
     assert len(store) == 2
     # Close so the server can open it fresh.
     store.close()
@@ -672,8 +687,14 @@ def test_query_with_bad_vec_shape_does_not_burn_nonce(
         headers={"X-PAYMENT": header_bad},
     )
     assert r1.status_code == 400, r1.text
-    # The store must NOT have the nonce yet — verify directly.
-    assert not server._nonce_store.has(bob_account.address.lower(), nonce.lower())
+    # The store must NOT have the nonce yet — verify directly. Pass the
+    # EIP-712 domain so we read from the same partition the server writes.
+    assert not server._nonce_store.has(
+        bob_account.address.lower(),
+        nonce.lower(),
+        chain_id=CHAIN_ID,
+        verifying_contract=USDC,
+    )
 
     # Second POST — correct shape, SAME nonce. Should succeed because the
     # nonce was never committed on the previous (400) request.
@@ -750,8 +771,15 @@ def test_rate_limited_request_does_not_burn_nonce(bob_account, alice_account):
     )
     assert r2.status_code == 429, r2.text
 
-    # nonce_B must NOT be in the store — 429 path never commits.
-    assert not nonce_store.has(bob_account.address.lower(), nonce_b.lower())
+    # nonce_B must NOT be in the store — 429 path never commits. Pass
+    # the EIP-712 domain so we read from the same partition the server
+    # would have written into.
+    assert not nonce_store.has(
+        bob_account.address.lower(),
+        nonce_b.lower(),
+        chain_id=CHAIN_ID,
+        verifying_contract=USDC,
+    )
 
     # 3) Reset the rate limiter (fresh bucket) and retry SAME nonce_B —
     #    proves the 429 didn't consume it.
@@ -904,7 +932,7 @@ def test_x402_client_rejects_wrong_recipient(client, bob_account, alice_account)
             signer=bob_account,
             chain_id=CHAIN_ID,
             asset_address=USDC,
-            max_amount_usdc=PRICE_USDC,
+            expected_price_usdc=PRICE_USDC,
             transport=client,
             expected_recipient=other_recipient,
         )
@@ -922,7 +950,7 @@ def test_x402_client_accepts_matching_recipient(client, bob_account, alice_accou
         signer=bob_account,
         chain_id=CHAIN_ID,
         asset_address=USDC,
-        max_amount_usdc=PRICE_USDC,
+        expected_price_usdc=PRICE_USDC,
         transport=client,
         expected_recipient=alice_account.address,
     )

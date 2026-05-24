@@ -61,7 +61,7 @@ def _pick_accept(
     *,
     network: str,
     asset_address: str,
-    max_units: int,
+    expected_price_units: int,
     expected_recipient: Optional[str] = None,
 ) -> dict[str, Any]:
     """Pick the first accept entry that satisfies our policy.
@@ -71,6 +71,16 @@ def _pick_accept(
     prevents a malicious or compromised server from swapping the
     recipient on us after we've already approved the price — Alice's
     public address is pinned by the caller, not the server.
+
+    Phase 4 audit (B6 / P1 #8): we also enforce a **strict** price cap.
+    The previous policy was "accept anything ≤ max_units", which let a
+    server quote 1.5× the advertised price as long as the client's
+    budget cap (a single round-trip override) was generous. The audit
+    HIGH-2 finding asked for ``value == expected_price`` (strict). We
+    pass ``expected_price_units`` and refuse any entry whose
+    ``maxAmountRequired`` exceeds it — the upper bound is set by the
+    caller from out-of-band knowledge (e.g. the price quoted on Alice's
+    public landing page), NOT by the server's 402 body.
     """
     recipient_lc = expected_recipient.lower() if expected_recipient else None
     matched_amount_ok = False
@@ -83,8 +93,8 @@ def _pick_accept(
             continue
         if (a["asset"] or "").lower() != asset_address.lower():
             continue
-        if a["max_amount_required"] > max_units:
-            continue  # would exceed client budget
+        if a["max_amount_required"] > expected_price_units:
+            continue  # server quoted more than we expected — refuse
         matched_amount_ok = True
         if recipient_lc is not None and (a["pay_to"] or "").lower() != recipient_lc:
             # Server says pay to X, caller pinned recipient Y. Refuse.
@@ -97,8 +107,9 @@ def _pick_accept(
             f"server pay_to did not match expected recipient {expected_recipient}"
         )
     raise X402Error(
-        "no acceptable payment requirement: "
-        "no entry matched scheme/network/asset and stayed under budget"
+        f"no acceptable payment requirement: no entry matched "
+        f"scheme/network/asset and stayed at or under expected price "
+        f"{expected_price_units} base units"
     )
 
 
@@ -166,7 +177,7 @@ def x402_pay_and_post(
     signer,
     chain_id: int,
     asset_address: str,
-    max_amount_usdc: float | str | Decimal,
+    expected_price_usdc: float | str | Decimal,
     network: str = DEFAULT_NETWORK,
     transport=None,
     expected_recipient: Optional[str] = None,
@@ -179,10 +190,22 @@ def x402_pay_and_post(
     Phase 3 audit (F11): pass ``expected_recipient`` to pin the
     server's ``payTo`` — if any 402 ``accepts[]`` entry advertises a
     different address, the client refuses to sign and raises
-    ``X402Error``. Callers SHOULD always set this in production so a
-    compromised server can't redirect funds.
+    ``X402Error``.
+
+    Phase 4 audit (B6 / P1 #8): ``expected_price_usdc`` is now a
+    **REQUIRED** argument and is treated as a strict upper bound on
+    ``maxAmountRequired``. The previous ``max_amount_usdc`` parameter
+    was a loose "budget cap" — useful for protecting the wallet, but
+    NOT for catching a server that quoted 1.5× its advertised price on
+    a single round trip. Callers MUST know the price ahead of time
+    (typically from the operator's public landing page) and pass it
+    here; if the server's quote exceeds it on any ``accepts[]`` entry,
+    the client refuses to sign and raises ``X402Error``.
+
+    The argument name changes deliberately so static analysis flags any
+    in-tree caller still using the loose ``max_amount_usdc`` form.
     """
-    max_units = usdc_to_base_units(max_amount_usdc)
+    expected_units = usdc_to_base_units(expected_price_usdc)
     close_after = False
     if transport is None:
         transport = httpx.Client(timeout=30.0)
@@ -211,11 +234,13 @@ def x402_pay_and_post(
             accepts,
             network=network,
             asset_address=asset_address,
-            max_units=max_units,
+            expected_price_units=expected_units,
             expected_recipient=expected_recipient,
         )
 
-        # 2. Sign + retry.
+        # 2. Sign + retry. The picker already enforced
+        # ``max_amount_required <= expected_price_units``, so the
+        # signed value cannot exceed what we approved.
         header = _build_payment_header(
             signer=signer,
             accept=accept,
@@ -245,7 +270,7 @@ def x402_query(
     signer,
     chain_id: int,
     asset_address: str,
-    max_amount_usdc: float | str | Decimal,
+    expected_price_usdc: float | str | Decimal,
     network: str = DEFAULT_NETWORK,
     transport=None,
     expected_recipient: Optional[str] = None,
@@ -257,8 +282,10 @@ def x402_query(
     The caller is responsible for computing ``query_vec`` (Slice-4 does NOT
     compute embeddings — see README).
 
-    Phase 3 audit (F11): forward ``expected_recipient`` so the wrapper
-    inherits the same recipient-pinning guarantee as :func:`x402_pay_and_post`.
+    Phase 3 audit (F11) / Phase 4 audit (B6 / P1 #8): both
+    ``expected_recipient`` and ``expected_price_usdc`` are forwarded so
+    the wrapper inherits the same pinning guarantees as
+    :func:`x402_pay_and_post`. ``expected_price_usdc`` is REQUIRED.
     """
     vec = np.asarray(query_vec, dtype=np.float32)
     body = {"query_vec": vec.tolist(), "k": int(k)}
@@ -268,7 +295,7 @@ def x402_query(
         signer=signer,
         chain_id=chain_id,
         asset_address=asset_address,
-        max_amount_usdc=max_amount_usdc,
+        expected_price_usdc=expected_price_usdc,
         network=network,
         transport=transport,
         expected_recipient=expected_recipient,
