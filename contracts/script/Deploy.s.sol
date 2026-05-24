@@ -10,6 +10,7 @@ import {MemoryAnchor} from "../src/MemoryAnchor.sol";
 import {BondVault} from "../src/BondVault.sol";
 import {PerformanceOracle, IBondVault} from "../src/PerformanceOracle.sol";
 import {AgentRegistry} from "../src/AgentRegistry.sol";
+import {Colosseum} from "../src/Colosseum.sol";
 import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 
 /// @title  Deploy
@@ -94,6 +95,16 @@ contract Deploy is Script {
         {
             AgentRegistry agentRegistry = new AgentRegistry(identityRegistry);
             _logAgentRegistry(address(agentRegistry), identityRegistry);
+        }
+
+        // Colosseum: the live-duel backbone (parimutuel betting + chaos ledger +
+        // adversarial-resilience scoring). recorder + treasury default to the
+        // deployer; the duel_runner signs as the recorder. Scoped block keeps
+        // run()'s stack under the 16-slot limit (no via-ir).
+        {
+            Colosseum colosseum = new Colosseum(IERC20(usdc), deployer, deployer);
+            console2.log("Colosseum           :", address(colosseum));
+            console2.log("  recorder          :", deployer);
         }
 
         vm.stopBroadcast();

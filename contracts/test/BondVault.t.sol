@@ -183,4 +183,36 @@ contract BondVaultTest is Test {
         vault.setReleaseWindow(123);
         assertEq(vault.releaseWindow(), 123);
     }
+
+    // -----------------------------------------------------------------------
+    // releaseToOperator (dead-agent rescue — must pay the funder, not a caller)
+    // -----------------------------------------------------------------------
+
+    function test_releaseToOperator_pays_funder_not_caller() public {
+        vm.prank(alice);
+        vault.post(2 * ONE_USDC);
+
+        // Agent goes quiet past the liveness timeout (no checker → time-only).
+        skip(LIVENESS + 1);
+        assertFalse(vault.isAgentAlive(alice));
+
+        // A random third party triggers the rescue. The bond returns to the
+        // funder (alice), never to the caller — the old caller-supplied
+        // recipient theft vector is gone (signature no longer accepts one).
+        address stranger = address(0xBADBAD);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(stranger);
+        vault.releaseToOperator(alice);
+
+        assertEq(usdc.balanceOf(alice) - aliceBefore, 2 * ONE_USDC);
+        assertEq(usdc.balanceOf(stranger), 0);
+        assertEq(vault.balanceOf(alice), 0);
+    }
+
+    function test_releaseToOperator_reverts_while_alive() public {
+        vm.prank(alice);
+        vault.post(2 * ONE_USDC);
+        vm.expectRevert(BondVault.AgentStillAlive.selector);
+        vault.releaseToOperator(alice);
+    }
 }

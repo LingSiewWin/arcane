@@ -3,6 +3,7 @@ pragma solidity ^0.8.25;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 
@@ -42,7 +43,7 @@ interface IBondVault {
 ///         the Pyth update fee from `msg.value` and refunds the excess. The
 ///         oracle has skin in the game: every slash burns an equal counter-bond
 ///         it posted, so a frivolous oracle drains its own balance.
-contract PerformanceOracle {
+contract PerformanceOracle is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     IPyth public immutable pyth;
@@ -158,7 +159,7 @@ contract PerformanceOracle {
         uint32 slashThresholdBps,
         uint256 slashAmount,
         bytes[] calldata priceUpdate
-    ) external payable onlyRecorder {
+    ) external payable onlyRecorder nonReentrant {
         if (direction != 1 && direction != -1) revert InvalidDirection();
         if (horizonSecs == 0) revert ZeroHorizon();
         if (slashAmount == 0) revert ZeroSlashAmount();
@@ -231,7 +232,11 @@ contract PerformanceOracle {
     ///
     /// @param agent       the agent whose advice to resolve.
     /// @param priceUpdate the Hermes VAA(s) for `updatePriceFeeds`.
-    function resolve(address agent, bytes[] calldata priceUpdate) external payable {
+    function resolve(address agent, bytes[] calldata priceUpdate)
+        external
+        payable
+        nonReentrant
+    {
         Advice storage a = advice[agent];
         if (!a.exists) revert NoAdvice();
         if (a.resolved) revert AlreadyResolved();

@@ -446,4 +446,83 @@ contract PerformanceOracleTest is Test {
         );
         oracle.resolve{value: 0}(alice, upd);
     }
+
+    // ------------------------------------------------------------------
+    // reentrancy guard
+    // ------------------------------------------------------------------
+
+    /// @notice A malicious resolver that reenters resolve() for a SECOND agent
+    ///         on the ETH-refund callback must be blocked by nonReentrant. The
+    ///         nested call reverts (caught here), and the second agent stays
+    ///         unresolved — no nested state mutation slips through.
+    function test_resolve_reentrancy_blocked() public {
+        address bob = address(0xB0B2);
+        // Record advice for both alice and bob (long, generous threshold → the
+        // favorable resolution below takes the no-slash branch).
+        _record(1, 200);
+        bytes[] memory brec = _updateBlob(P0, CONF_TIGHT, block.timestamp);
+        uint256 brecFee = pyth.getUpdateFee(brec);
+        vm.deal(recorder, brecFee);
+        vm.prank(recorder);
+        oracle.recordAdvice{value: brecFee}(bob, SOL_USD, 1, 1 hours, 200, SLASH_AMT, brec);
+
+        skip(1 hours + 1);
+
+        // Favorable price (+1.1%) → both resolutions would pass (no slash).
+        int64 p1 = 8_800_000_000;
+        bytes[] memory aliceBlob = _updateBlob(p1, CONF_TIGHT, block.timestamp);
+        bytes[] memory bobBlob = _updateBlob(p1, CONF_TIGHT, block.timestamp);
+
+        ReentrantResolver attacker = new ReentrantResolver(oracle);
+        vm.deal(address(attacker), 1 ether);
+        attacker.arm(bob, bobBlob, 1); // reenter resolve(bob) with a 1-wei fee
+
+        // Outer resolve forwards all balance → oracle refunds the excess →
+        // triggers the attacker's receive(), which attempts the nested resolve.
+        attacker.attack(alice, aliceBlob);
+
+        assertTrue(attacker.reenterReverted(), "nested resolve should be guarded");
+        (, , , , , , , , , , bool aliceResolved, ) = oracle.advice(alice);
+        (, , , , , , , , , , bool bobResolved, ) = oracle.advice(bob);
+        assertTrue(aliceResolved, "outer resolve completed");
+        assertFalse(bobResolved, "nested resolve must NOT have taken effect");
+    }
+}
+
+/// @dev Attacker used by test_resolve_reentrancy_blocked. On the ETH refund it
+///      tries to reenter resolve() for a different agent; the guard must revert
+///      that nested call (caught so the outer call still completes).
+contract ReentrantResolver {
+    PerformanceOracle public immutable oracle;
+    address public reenterAgent;
+    bytes[] internal reenterBlob;
+    uint256 public reenterFee;
+    bool public tried;
+    bool public reenterReverted;
+
+    constructor(PerformanceOracle _oracle) {
+        oracle = _oracle;
+    }
+
+    function arm(address agent, bytes[] calldata blob, uint256 fee) external {
+        reenterAgent = agent;
+        delete reenterBlob;
+        for (uint256 i; i < blob.length; i++) reenterBlob.push(blob[i]);
+        reenterFee = fee;
+    }
+
+    function attack(address agent, bytes[] calldata blob) external {
+        oracle.resolve{value: address(this).balance}(agent, blob);
+    }
+
+    receive() external payable {
+        if (!tried) {
+            tried = true;
+            try oracle.resolve{value: reenterFee}(reenterAgent, reenterBlob) {
+                reenterReverted = false;
+            } catch {
+                reenterReverted = true;
+            }
+        }
+    }
 }

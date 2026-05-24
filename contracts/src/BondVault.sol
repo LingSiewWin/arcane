@@ -89,6 +89,11 @@ contract BondVault is Ownable, Pausable {
         uint64 lastActivityAt;
         uint256 lastActivitySignal;
         bool oracleApprovedRelease;
+        // The address that funded this bond. A dead-agent rescue
+        // (`releaseToOperator`) always returns funds here — never to a
+        // caller-supplied address — so the permissionless rescue can't be
+        // used to redirect another agent's bond.
+        address operator;
     }
 
     /// @notice agent => bond state
@@ -210,6 +215,7 @@ contract BondVault is Ownable, Pausable {
         b.postedAt = uint64(block.timestamp);
         b.lastActivityAt = uint64(block.timestamp);
         b.oracleApprovedRelease = false;
+        b.operator = msg.sender; // the funder; recipient of any dead-agent rescue
         // Snapshot the agent's initial activity signal so the liveness check
         // has a baseline. We tolerate a missing checker (zero) — in that case
         // liveness is purely time-based.
@@ -346,19 +352,23 @@ contract BondVault is Ownable, Pausable {
         return block.timestamp < uint256(b.lastActivityAt) + livenessTimeout;
     }
 
-    /// @notice Rescue a dead agent's bond to `operator`. Permissionless —
-    ///         anyone can call once the liveness deadline has passed. This
-    ///         matches Olas' "eviction returns the stake" posture (we don't
-    ///         slash dead agents; that would punish the operator for an
-    ///         infrastructure failure they couldn't control).
+    /// @notice Rescue a dead agent's bond back to the address that funded it.
+    ///         Permissionless — anyone can call once the liveness deadline has
+    ///         passed — but the recipient is the recorded `operator` (the
+    ///         funder), NOT a caller-supplied address, so the rescue can't be
+    ///         used to redirect/steal the bond. This matches Olas' "eviction
+    ///         returns the stake" posture (we don't slash dead agents; that
+    ///         would punish the operator for an infrastructure failure they
+    ///         couldn't control).
     /// @dev    Allowed while paused — a paused vault must not hold operators'
     ///         bonds hostage when an agent is provably dead.
-    function releaseToOperator(address agent, address operator) external {
-        if (operator == address(0)) revert InvalidAddress();
+    function releaseToOperator(address agent) external {
         Bond storage b = bonds[agent];
         uint256 bal = b.balance;
         if (bal == 0) revert NoBond();
         if (isAgentAlive(agent)) revert AgentStillAlive();
+        address operator = b.operator;
+        if (operator == address(0)) revert InvalidAddress();
 
         b.balance = 0;
         bondToken.safeTransfer(operator, bal);

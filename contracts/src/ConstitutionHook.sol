@@ -78,6 +78,7 @@ contract ConstitutionHook is IHook {
     error NotInstalled();
     error AlreadyInstalled();
     error UnsupportedOuterSelector(bytes4 selector);
+    error BalanceQueryFailed();
 
     constructor(ConstitutionRegistry _registry, address _token) {
         registry = _registry;
@@ -416,14 +417,18 @@ contract ConstitutionHook is IHook {
         }
     }
 
-    /// @dev Static-call the token's `balanceOf(address)`. Returns 0 if
-    ///      the call fails (e.g. token is not an ERC-20). This keeps
-    ///      the hook from soft-bricking accounts that hold no USDC.
+    /// @dev Static-call the token's `balanceOf(address)`. Reverts if the call
+    ///      fails or returns malformed data. We must NOT swallow a failure as a
+    ///      zero balance: a real ERC-20 returns 32 bytes even for a zero
+    ///      balance, so the only way to reach here with `!ok`/short data is a
+    ///      broken/non-ERC-20 `token`. Treating that as 0 would set preBalance=0
+    ///      and silently bypass the MAX_TRADE_SIZE outcome check in postCheck
+    ///      (outflow = preBalance - postBalance can never trigger). Fail loud.
     function _balanceOf(address account) internal view returns (uint256 bal) {
         (bool ok, bytes memory ret) = token.staticcall(
             abi.encodeWithSelector(ERC20_BALANCE_OF_SELECTOR, account)
         );
-        if (!ok || ret.length < 32) return 0;
+        if (!ok || ret.length < 32) revert BalanceQueryFailed();
         bal = abi.decode(ret, (uint256));
     }
 }
