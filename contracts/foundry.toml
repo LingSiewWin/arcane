@@ -11,6 +11,7 @@ via_ir = false
 remappings = [
     "forge-std/=lib/forge-std/src/",
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@pythnetwork/pyth-sdk-solidity/=lib/pyth-sdk-solidity/",
 ]
 fs_permissions = [{ access = "read", path = "./"}]
 
