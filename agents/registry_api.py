@@ -43,7 +43,6 @@ fabricated rows.
 from __future__ import annotations
 
 import os
-import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -56,7 +55,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agents.dark_pool import DarkPoolServer
-from agents.memory_service import MemoryService, hash_to_vec
+from agents.embedder import Embedder
+from agents.memory_service import MemoryService
 from scripts.lib.chain import cast_send, rpc_call, wait_for_receipt
 
 # Action kinds — mirror the AgentAction enum in AgentRegistry.sol.
@@ -264,41 +264,10 @@ def find_agent_action_in_receipt(
 # ---------------------------------------------------------------------------
 
 
-class _Embedder:
-    """Lazily-loaded MiniLM embedder with a deterministic fallback.
-
-    ``embedding_model=None`` forces the deterministic ``hash_to_vec`` path —
-    used by tests so we don't pay torch's import cost or require model weights.
-    """
-
-    def __init__(
-        self,
-        model_name: Optional[str] = DEFAULT_EMBED_MODEL,
-        dim: int = DEFAULT_EMBED_DIM,
-        seed: int = 0,
-    ) -> None:
-        self.model_name = model_name
-        self.dim = int(dim)
-        self.seed = int(seed)
-        self._model = None
-        self._lock = threading.Lock()
-
-    def embed(self, text: str) -> np.ndarray:
-        if self.model_name is None:
-            return hash_to_vec(text, dim=self.dim, seed=self.seed)
-        with self._lock:
-            if self._model is None:
-                from sentence_transformers import SentenceTransformer
-
-                self._model = SentenceTransformer(self.model_name)
-        emb = self._model.encode(
-            [text], normalize_embeddings=True, show_progress_bar=False
-        )[0].astype(np.float32)
-        if emb.shape[0] != self.dim:
-            raise RuntimeError(
-                f"embedding dim mismatch: got {emb.shape[0]}, want {self.dim}"
-            )
-        return emb
+# The embedder now lives in ``agents/embedder.py`` so duel agents can embed
+# without importing this FastAPI/pydantic module. Kept as a module-level alias
+# for backwards compatibility with code that references ``_Embedder`` here.
+_Embedder = Embedder
 
 
 # ---------------------------------------------------------------------------
