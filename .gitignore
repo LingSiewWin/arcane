@@ -32,3 +32,9 @@ keystore/
 *.localfork.bak
 Screenshot*.png
 image.png
+
+# large media editing sources — keep out of git; commit the compressed web asset only
+*.source.mp4
+
+# editor-local workspace settings (personal, not shared)
+.vscode/

@@ -4,3 +4,5 @@ arc-testnet.broadcast.json
 *.private.json
 *.key
 *.secret
+# Transient forge run logs — regenerable, and could capture a tokenized RPC.
+*.deploy.log
