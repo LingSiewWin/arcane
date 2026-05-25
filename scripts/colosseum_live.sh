@@ -70,7 +70,10 @@ export REPO_ROOT
 # because we only fill ones that are currently empty.
 if [[ -f "$REPO_ROOT/.env" ]]; then
   while IFS='=' read -r k v; do
-    [[ -z "$k" || "$k" == \#* || "$k" != *[A-Za-z]* ]] && continue
+    k="${k// /}"  # tolerate "KEY = val" spacing
+    # Only accept valid shell identifiers — never let a malformed .env line set
+    # something like IFS/PATH.
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
     [[ -z "${!k:-}" ]] && export "$k=$v"
   done < "$REPO_ROOT/.env"
@@ -113,7 +116,8 @@ if [[ -n "${DEPLOYER_PK:-}" ]]; then
 else
   PK_RESOLVED="$(resolve_key)" || { echo "could not resolve deployer key" >&2; exit 3; }
 fi
-DEPLOYER_ADDR="$("$PY" -c "from eth_account import Account; print(Account.from_key('$PK_RESOLVED').address)")"
+# Derive the address WITHOUT putting the key on argv (it would show in `ps`).
+DEPLOYER_ADDR="$(PK="$PK_RESOLVED" "$PY" -c "import os; from eth_account import Account; print(Account.from_key(os.environ['PK']).address)")"
 
 echo "================ The Colosseum — LIVE on Arc ================"
 echo "  account : ${ACCOUNT:-<DEPLOYER_PK>}  ($DEPLOYER_ADDR)"
@@ -131,7 +135,7 @@ if [[ -z "$COLOSSEUM" ]]; then
     cd "$CONTRACTS_DIR" && \
     PRIVATE_KEY="$PK_RESOLVED" forge script "script/Deploy.s.sol:Deploy" \
       --rpc-url "$RPC_EFFECTIVE" --broadcast --slow
-  ) 2>&1 | tee "$RUN_LOG"
+  ) 2>&1 | sed -E 's#(swrm_)[A-Za-z0-9]+#\1<redacted>#g' | tee "$RUN_LOG"
   COLOSSEUM="$(grep -E "^[[:space:]]*Colosseum[[:space:]]*:[[:space:]]+0x[0-9a-fA-F]{40}" "$RUN_LOG" | tail -1 | awk '{print $NF}')"
   [[ -n "$COLOSSEUM" ]] || { echo "could not parse Colosseum address from forge output (see $RUN_LOG)" >&2; exit 5; }
 fi
