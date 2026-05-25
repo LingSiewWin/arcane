@@ -215,7 +215,7 @@ export function ArenaPlane() {
   const selectedNode = nodes.find((n) => n.agentId === selected) ?? null;
 
   return (
-    <Card className="flex flex-col gap-3 p-4">
+    <section className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
         <PanelTitle index="03" title="Living economy" subtitle="proven agents · clustered by action" />
         <span className="inline-flex items-center gap-1.5">
@@ -225,6 +225,7 @@ export function ArenaPlane() {
           </span>
         </span>
       </div>
+      <Card className="flex flex-col gap-3 p-4">
 
       {nodes.length === 0 ? (
         <div className="flex h-64 items-center justify-center rounded-md border border-dashed border-border/50 text-center">
@@ -313,6 +314,7 @@ export function ArenaPlane() {
           </p>
         </div>
       ) : null}
-    </Card>
+      </Card>
+    </section>
   );
 }

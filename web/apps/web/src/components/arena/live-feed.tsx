@@ -143,10 +143,7 @@ export function LiveFeed() {
     : "";
 
   return (
-    <Card className="flex h-full flex-col gap-3 p-4">
-      <p aria-live="polite" aria-atomic="true" className="sr-only">
-        {announcement}
-      </p>
+    <section className="flex h-full flex-col gap-3">
       <div className="flex items-center justify-between">
         <PanelTitle index="02" title="Live activity" subtitle="AgentAction stream" />
         <span className="inline-flex items-center gap-1.5">
@@ -156,6 +153,10 @@ export function LiveFeed() {
           </span>
         </span>
       </div>
+      <Card className="flex flex-1 flex-col gap-3 p-4">
+      <p aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcement}
+      </p>
 
       {!REGISTRY_CONFIGURED ? (
         <ArenaEmpty title="Feed idle">
@@ -182,6 +183,7 @@ export function LiveFeed() {
           </AnimatePresence>
         </ul>
       )}
-    </Card>
+      </Card>
+    </section>
   );
 }

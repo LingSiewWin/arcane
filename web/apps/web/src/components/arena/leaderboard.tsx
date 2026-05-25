@@ -1,7 +1,6 @@
 "use client";
 
-import { Trophy } from "lucide-react";
-import Link from "next/link";
+import { Shield, Trophy } from "lucide-react";
 
 import { Card } from "@web/ui/components/card";
 import {
@@ -13,140 +12,155 @@ import {
   TableRow,
 } from "@web/ui/components/table";
 
-import {
-  ORACLE_CONFIGURED,
-  reputationFor,
-  useAgents,
-  useReputation,
-  REGISTRY_CONFIGURED,
-  type ArenaAgent,
-  type ReputationRecord,
-} from "@/lib/arena";
+import { COLOSSEUM_CONFIGURED, useArenaStandings, type ArenaStanding } from "@/lib/colosseum";
 import { addressUrl } from "@/lib/chain";
-import { fmtWinRate, shortHash } from "@/lib/format";
+import { shortHash } from "@/lib/format";
 
 import { PanelTitle } from "@/components/panels/primitives";
 
 import { ArenaEmpty } from "./arena-empty";
 
-interface Ranked {
-  agent: ArenaAgent;
-  rep: ReputationRecord;
-  /** bond-weighted score = winRate * sqrt(resolves). honest 0 when no resolves. */
-  score: number;
+/** Signed basis-points, e.g. "+12 bps" / "−5 bps". */
+function fmtAlpha(bps: number): string {
+  const sign = bps > 0 ? "+" : bps < 0 ? "−" : "";
+  return `${sign}${Math.abs(bps).toLocaleString("en-US")} bps`;
 }
 
-function rank(agents: ArenaAgent[], repMap: Map<string, ReputationRecord> | undefined): Ranked[] {
-  return agents
-    .map((agent) => {
-      const rep = reputationFor(repMap, agent.operator);
-      const total = rep.wins + rep.losses;
-      // Bond-weighted: more resolutions = more statistically meaningful.
-      const winRate = total === 0 ? 0 : rep.wins / total;
-      const score = total === 0 ? 0 : winRate * Math.sqrt(total);
-      return { agent, rep, score };
-    })
-    .sort((a, b) => b.score - a.score || b.rep.wins - a.rep.wins);
+/** survived/ingested, honest "—" when nothing was ingested. */
+function fmtResilience(s: ArenaStanding): string {
+  if (s.ingested === 0) return "—";
+  return `${s.survived}/${s.ingested}`;
+}
+
+function AddressLink({ address }: { address: string }) {
+  return (
+    <a
+      href={addressUrl(address)}
+      target="_blank"
+      rel="noreferrer"
+      className="font-mono text-xs text-primary/90 hover:underline"
+    >
+      {shortHash(address)}
+    </a>
+  );
+}
+
+/** A single ranking table (Alpha or Iron Shield) over the standings. */
+function RankingCard({
+  standings,
+  metric,
+}: {
+  standings: ArenaStanding[];
+  metric: "alpha" | "shield";
+}) {
+  return (
+    <Card className="p-0">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-12">#</TableHead>
+            <TableHead>Agent</TableHead>
+            <TableHead className="text-right">Alpha</TableHead>
+            <TableHead className="text-right">Iron Shield</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {standings.map((s, i) => (
+            <TableRow key={s.address}>
+              <TableCell className="font-mono text-muted-foreground">
+                {i === 0 ? (
+                  metric === "alpha" ? (
+                    <Trophy className="size-4 text-[--color-signal]" />
+                  ) : (
+                    <Shield className="size-4 text-[--color-signal]" />
+                  )
+                ) : (
+                  i + 1
+                )}
+              </TableCell>
+              <TableCell>
+                <AddressLink address={s.address} />
+              </TableCell>
+              <TableCell
+                className={`text-right font-mono text-xs tabular-nums ${
+                  s.alphaBps > 0
+                    ? "text-[--color-ok]"
+                    : s.alphaBps < 0
+                      ? "text-[--color-alarm]"
+                      : "text-muted-foreground"
+                }`}
+              >
+                {fmtAlpha(s.alphaBps)}
+              </TableCell>
+              <TableCell className="text-right font-mono text-xs tabular-nums">
+                {fmtResilience(s)}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
+  );
 }
 
 export function Leaderboard() {
-  const agents = useAgents();
-  const reputation = useReputation();
+  const standings = useArenaStandings();
 
-  if (!REGISTRY_CONFIGURED) {
+  if (!COLOSSEUM_CONFIGURED) {
     return (
       <section className="flex flex-col gap-4">
-        <PanelTitle index="03" title="Leaderboard" subtitle="registry not configured" />
+        <PanelTitle index="03" title="Arena Standings" subtitle="colosseum not configured" />
         <ArenaEmpty
-          title="Registry not configured"
-          cmd="NEXT_PUBLIC_AGENT_REGISTRY=0x… in web/apps/web/.env.local"
+          title="Colosseum not configured"
+          cmd="NEXT_PUBLIC_COLOSSEUM=0x… in web/apps/web/.env.local"
         >
-          Set the registry (and optionally the oracle) to rank agents by win/loss.
+          Standings are derived from Colosseum{" "}
+          <span className="font-mono">CallReported</span> events. Point the app at the Colosseum to
+          rank agents by Alpha (cumulative PnL) and Iron Shield (manipulation resilience).
         </ArenaEmpty>
       </section>
     );
   }
 
-  const ranked = rank(agents.data ?? [], reputation.data);
-  const anyResolves = ranked.some((r) => r.rep.wins + r.rep.losses > 0);
+  const data = standings.data ?? [];
+
+  if (data.length === 0) {
+    return (
+      <section className="flex flex-col gap-4">
+        <PanelTitle index="03" title="Arena Standings" subtitle="alpha · iron shield" />
+        <ArenaEmpty title="No scored calls yet — start an arena">
+          No <span className="font-mono">CallReported</span> events on-chain yet. Agents enter the
+          standings the moment a duel scores their first trading call.
+        </ArenaEmpty>
+      </section>
+    );
+  }
+
+  // Alpha: cumulative PnL desc. Iron Shield: resilience desc, alpha tie-break.
+  const byAlpha = [...data].sort((a, b) => b.alphaBps - a.alphaBps);
+  const byShield = [...data].sort(
+    (a, b) => b.resilience - a.resilience || b.alphaBps - a.alphaBps,
+  );
 
   return (
-    <section className="flex flex-col gap-4">
-      <PanelTitle
-        index="03"
-        title="Leaderboard"
-        subtitle={ORACLE_CONFIGURED ? "bond-weighted win rate" : "oracle not configured"}
-      />
+    <section className="flex flex-col gap-6">
+      <div className="flex flex-col gap-4">
+        <PanelTitle
+          index="03"
+          title="Alpha"
+          subtitle="cumulative PnL — sum of scored calls (bps)"
+        />
+        <RankingCard standings={byAlpha} metric="alpha" />
+      </div>
 
-      {!ORACLE_CONFIGURED ? (
-        <ArenaEmpty
-          title="Oracle not configured"
-          cmd="NEXT_PUBLIC_PERFORMANCE_ORACLE=0x… in web/apps/web/.env.local"
-        >
-          The leaderboard is derived from PerformanceOracle{" "}
-          <span className="font-mono">AdviceResolved</span> events. Point it at the oracle to rank
-          agents by win/loss.
-        </ArenaEmpty>
-      ) : !anyResolves || ranked.length === 0 ? (
-        <ArenaEmpty title="No resolutions yet">
-          No <span className="font-mono">AdviceResolved</span> events on-chain yet. Agents climb the
-          board as their advice is scored (slashed = loss, released = win).
-        </ArenaEmpty>
-      ) : (
-        <Card className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-12">#</TableHead>
-                <TableHead>Agent</TableHead>
-                <TableHead>Operator</TableHead>
-                <TableHead className="text-right">W / L</TableHead>
-                <TableHead className="text-right">Win rate</TableHead>
-                <TableHead className="text-right">Score</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {ranked.map((r, i) => {
-                const total = r.rep.wins + r.rep.losses;
-                return (
-                  <TableRow key={r.agent.agentId}>
-                    <TableCell className="font-mono text-muted-foreground">
-                      {i === 0 ? <Trophy className="size-4 text-[--color-signal]" /> : i + 1}
-                    </TableCell>
-                    <TableCell>
-                      <Link
-                        href={`/arena/${r.agent.agentId}`}
-                        className="font-mono text-xs text-primary/90 hover:underline"
-                      >
-                        #{r.agent.agentId} · id {r.agent.identityId.toString()}
-                      </Link>
-                    </TableCell>
-                    <TableCell>
-                      <a
-                        href={addressUrl(r.agent.operator)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="font-mono text-xs text-primary/90 hover:underline"
-                      >
-                        {shortHash(r.agent.operator)}
-                      </a>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">
-                      {total === 0 ? "—" : `${r.rep.wins} / ${r.rep.losses}`}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">
-                      {fmtWinRate(r.rep.wins, r.rep.losses)}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">
-                      {r.score === 0 ? "—" : r.score.toFixed(2)}
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </Card>
-      )}
+      <div className="flex flex-col gap-4">
+        <PanelTitle
+          index="04"
+          title="Iron Shield"
+          subtitle="manipulation resilience — injections survived / ingested"
+        />
+        <RankingCard standings={byShield} metric="shield" />
+      </div>
     </section>
   );
 }

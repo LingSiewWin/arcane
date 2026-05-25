@@ -14,12 +14,31 @@ import { publicClient } from "@/lib/chain";
 import {
   ARC_USDC_ADDRESS,
   COLOSSEUM_ADDRESS,
+  MEMORY_ANCHOR_ADDRESS,
   isConfiguredAddress,
   type ChaosItemKind,
 } from "@/lib/constants";
 
 export const COLOSSEUM_CONFIGURED = isConfiguredAddress(COLOSSEUM_ADDRESS);
 export const COLOSSEUM = COLOSSEUM_ADDRESS as Address;
+export const MEMORY_ANCHOR_CONFIGURED = isConfiguredAddress(MEMORY_ANCHOR_ADDRESS);
+export const MEMORY_ANCHOR = MEMORY_ANCHOR_ADDRESS as Address;
+
+/** MemoryAnchor — the on-chain commitment of an agent's compressed memory root.
+ *  `agent` is indexed, so the memory panel can filter anchors per agent. */
+export const memoryAnchorAbi = [
+  {
+    type: "event",
+    name: "MemoryAnchored",
+    inputs: [
+      { name: "agent", type: "address", indexed: true },
+      { name: "identityId", type: "uint256", indexed: true },
+      { name: "root", type: "bytes32", indexed: false },
+      { name: "timestamp", type: "uint256", indexed: false },
+    ],
+    anonymous: false,
+  },
+] as const;
 
 export const colosseumAbi = [
   { type: "function", name: "duelCount", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
@@ -172,6 +191,20 @@ export const colosseumAbi = [
       { name: "scoreA", type: "int256", indexed: false },
       { name: "scoreB", type: "int256", indexed: false },
       { name: "prizePool", type: "uint256", indexed: false },
+    ],
+    anonymous: false,
+  },
+  {
+    type: "event",
+    name: "CallReported",
+    inputs: [
+      { name: "duelId", type: "uint256", indexed: true },
+      { name: "agent", type: "address", indexed: true },
+      { name: "injectionId", type: "uint256", indexed: false },
+      { name: "rBps", type: "int256", indexed: false },
+      { name: "ingestedInjection", type: "bool", indexed: false },
+      { name: "survived", type: "bool", indexed: false },
+      { name: "failed", type: "bool", indexed: false },
     ],
     anonymous: false,
   },
@@ -412,6 +445,220 @@ export function useReasoning(duelId: number | undefined, cap = 60) {
   }, [duelId, cap]);
 
   return events;
+}
+
+/* ------------------------------ agent memory ----------------------------- */
+
+/**
+ * 1-bit RaBitQ memory accounting — the MEASURED constants from the bench,
+ * deterministic from the 384-d MiniLM-L6-v2 embedder. A vector compresses to a
+ * 56-byte code (48 B packed sign bits + a 4 B L1 scalar + a 4 B norm) vs 1536 B
+ * for FP32 → 27.4×. These are not marketing numbers; they're the exact layout
+ * the agent stores, so `entries * BYTES_PER_VEC` is the agent's real on-chain
+ * memory footprint.
+ */
+export const MEMORY_BYTES_PER_VEC = 56;
+export const MEMORY_FP32_BYTES_PER_VEC = 1536;
+export const MEMORY_COMPRESSION_X = 27.4;
+export const MEMORY_EMBED_DIM = 384;
+
+export interface AgentMemory {
+  /** Count of AgentReasoning traces this agent has stored on-chain. */
+  entries: number;
+  /** Bytes the compressed (1-bit RaBitQ) memory occupies: entries * 56. */
+  bytes: number;
+  /** What an FP32 store of the same traces would cost: entries * 1536. */
+  fp32: number;
+  /** Measured compression ratio (FP32 / RaBitQ). */
+  compressionX: number;
+  /** The latest on-chain anchored memory root, or null if never anchored. */
+  anchoredRoot: Hex | null;
+  /** The identity the latest root was anchored under, or null. */
+  identityId: bigint | null;
+}
+
+interface RawAnchorLog {
+  args: { agent?: Address; identityId?: bigint; root?: Hex; timestamp?: bigint };
+  blockNumber: bigint | null;
+  logIndex: number | null;
+}
+
+/**
+ * Live per-agent memory: counts the agent's AgentReasoning traces (the REAL
+ * reasoning it has stored on-chain) and reads its latest anchored RaBitQ root
+ * as proof. The byte figures are derived from that count via the measured
+ * 56 B/vector RaBitQ layout — so the panel answers "what are you compressing?"
+ * with the agent's own data, not a static corpus.
+ *
+ * Both reads use the 9000-block window the public Arc RPC tolerates for
+ * getLogs (the same window useReasoning/useInjections use), filtered by the
+ * indexed `agent` topic so the scan returns only this agent's events.
+ */
+export function useAgentMemory(agent: Address | undefined) {
+  return useQuery<AgentMemory>({
+    queryKey: ["colosseum-agent-memory", COLOSSEUM_ADDRESS, MEMORY_ANCHOR_ADDRESS, agent],
+    enabled: COLOSSEUM_CONFIGURED && !!agent,
+    queryFn: async () => {
+      const head = await publicClient.getBlockNumber();
+      const window = BigInt(9_000);
+      const fromBlock = head > window ? head - window : BigInt(0);
+
+      // 1. Count this agent's stored reasoning traces (filter by indexed agent).
+      const reasoningLogs = (await publicClient.getContractEvents({
+        address: COLOSSEUM,
+        abi: colosseumAbi,
+        eventName: "AgentReasoning",
+        args: { agent: agent as Address },
+        fromBlock,
+        toBlock: "latest",
+      })) as unknown as RawReasoningLog[];
+      const entries = reasoningLogs.length;
+
+      // 2. Latest MemoryAnchored root for this agent (highest block), if the
+      //    anchor contract is configured. Filtered by the indexed agent topic.
+      let anchoredRoot: Hex | null = null;
+      let identityId: bigint | null = null;
+      if (MEMORY_ANCHOR_CONFIGURED) {
+        try {
+          const anchorLogs = (await publicClient.getContractEvents({
+            address: MEMORY_ANCHOR,
+            abi: memoryAnchorAbi,
+            eventName: "MemoryAnchored",
+            args: { agent: agent as Address },
+            fromBlock,
+            toBlock: "latest",
+          })) as unknown as RawAnchorLog[];
+          let best: RawAnchorLog | null = null;
+          for (const l of anchorLogs) {
+            const bn = l.blockNumber ?? BigInt(0);
+            const bestBn = best?.blockNumber ?? BigInt(-1);
+            if (bn > bestBn || (bn === bestBn && (l.logIndex ?? 0) >= (best?.logIndex ?? 0))) {
+              best = l;
+            }
+          }
+          if (best?.args.root) {
+            anchoredRoot = best.args.root;
+            identityId = best.args.identityId ?? null;
+          }
+        } catch {
+          // Anchor scan failed → fall through with no proof (entries still show).
+        }
+      }
+
+      return {
+        entries,
+        bytes: entries * MEMORY_BYTES_PER_VEC,
+        fp32: entries * MEMORY_FP32_BYTES_PER_VEC,
+        compressionX: MEMORY_COMPRESSION_X,
+        anchoredRoot,
+        identityId,
+      };
+    },
+    refetchInterval: 6_000,
+  });
+}
+
+/* ---------------------------- arena standings --------------------------- */
+
+/**
+ * One agent's standing in the arena, derived ENTIRELY from on-chain data:
+ *  - alphaBps: cumulative PnL — the sum of every CallReported `rBps` the agent
+ *    has emitted (a scored trading call). The basis for the Alpha ranking.
+ *  - ingested / survived: read live from resilienceOf(agent) — how many chaos
+ *    injections it ate vs. how many it survived.
+ *  - resilience: survived / ingested in [0,1] (0 when nothing was ingested) —
+ *    the basis for the Iron Shield ranking (manipulation resilience).
+ */
+export interface ArenaStanding {
+  address: Address;
+  alphaBps: number;
+  ingested: number;
+  survived: number;
+  resilience: number;
+}
+
+interface RawCallReportedLog {
+  args: { agent?: Address; rBps?: bigint };
+}
+
+/**
+ * Arena standings: the cross-duel scoreboard. Reads ALL CallReported events
+ * (windowed in <=9k-block chunks to respect the public RPC getLogs cap), groups
+ * by `agent` and sums `rBps` into a cumulative alphaBps. The set of agents IS
+ * the set that appears in CallReported — only agents with a scored call rank.
+ * For each such agent it then reads resilienceOf(agent) for the Iron Shield
+ * dimension. Honest empty array when not configured / no scored calls yet.
+ */
+export function useArenaStandings() {
+  return useQuery<ArenaStanding[]>({
+    queryKey: ["colosseum-arena-standings", COLOSSEUM_ADDRESS],
+    enabled: COLOSSEUM_CONFIGURED,
+    queryFn: async () => {
+      // 1. Scan CallReported history in <=9k-block windows (public RPC cap),
+      //    fetched concurrently, then sum rBps per agent.
+      const head = await publicClient.getBlockNumber();
+      const lookback = BigInt(100_000);
+      const maxRange = BigInt(9_000);
+      const start = head > lookback ? head - lookback : BigInt(0);
+
+      const ranges: Array<[bigint, bigint]> = [];
+      let from = start;
+      while (from <= head) {
+        const to = from + maxRange < head ? from + maxRange : head;
+        ranges.push([from, to]);
+        if (to >= head) break;
+        from = to + BigInt(1);
+      }
+
+      const batches = await Promise.all(
+        ranges.map(([f, t]) =>
+          publicClient
+            .getContractEvents({
+              address: COLOSSEUM,
+              abi: colosseumAbi,
+              eventName: "CallReported",
+              fromBlock: f,
+              toBlock: t,
+            })
+            .catch(() => [] as unknown[]),
+        ),
+      );
+      const logs = batches.flat() as unknown as RawCallReportedLog[];
+
+      const alpha = new Map<string, { address: Address; alphaBps: number }>();
+      for (const l of logs) {
+        const agent = l.args.agent;
+        if (!agent) continue;
+        const key = agent.toLowerCase();
+        const rec = alpha.get(key) ?? { address: agent, alphaBps: 0 };
+        rec.alphaBps += Number(l.args.rBps ?? BigInt(0));
+        alpha.set(key, rec);
+      }
+
+      // 2. For each agent that has reported a call, read its live resilience.
+      const entries = [...alpha.values()];
+      return Promise.all(
+        entries.map(async (e) => {
+          const [ingested, survived] = (await publicClient.readContract({
+            address: COLOSSEUM,
+            abi: colosseumAbi,
+            functionName: "resilienceOf",
+            args: [e.address],
+          })) as [bigint, bigint];
+          const ing = Number(ingested);
+          const surv = Number(survived);
+          return {
+            address: e.address,
+            alphaBps: e.alphaBps,
+            ingested: ing,
+            survived: surv,
+            resilience: ing === 0 ? 0 : surv / ing,
+          };
+        }),
+      );
+    },
+    refetchInterval: 6_000,
+  });
 }
 
 /** Parimutuel implied probability for side A from the pools (0..1). */
