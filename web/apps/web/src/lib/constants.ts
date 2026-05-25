@@ -43,6 +43,13 @@ export const PERFORMANCE_ORACLE_ADDRESS = (
  */
 export const COLOSSEUM_ADDRESS = (env.NEXT_PUBLIC_COLOSSEUM ?? "").trim();
 
+/**
+ * MemoryAnchor address — where agents anchor their RaBitQ memory roots on-chain.
+ * Read from env (redeployed per run). Unset → the memory panel shows the live
+ * compression from on-chain reasoning events without the "anchored" proof.
+ */
+export const MEMORY_ANCHOR_ADDRESS = (env.NEXT_PUBLIC_MEMORY_ANCHOR ?? "").trim();
+
 /** True when the env names a plausible 20-byte address. */
 export function isConfiguredAddress(value: string): value is `0x${string}` {
   return /^0x[0-9a-fA-F]{40}$/.test(value);

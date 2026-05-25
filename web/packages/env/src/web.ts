@@ -23,12 +23,14 @@ export const env = createEnv({
     NEXT_PUBLIC_AGENT_REGISTRY: address.optional(),
     NEXT_PUBLIC_PERFORMANCE_ORACLE: address.optional(),
     NEXT_PUBLIC_COLOSSEUM: address.optional(),
+    NEXT_PUBLIC_MEMORY_ANCHOR: address.optional(),
     NEXT_PUBLIC_RPC_URL: z.string().url().optional(),
   },
   experimental__runtimeEnv: {
     NEXT_PUBLIC_AGENT_REGISTRY: process.env.NEXT_PUBLIC_AGENT_REGISTRY,
     NEXT_PUBLIC_PERFORMANCE_ORACLE: process.env.NEXT_PUBLIC_PERFORMANCE_ORACLE,
     NEXT_PUBLIC_COLOSSEUM: process.env.NEXT_PUBLIC_COLOSSEUM,
+    NEXT_PUBLIC_MEMORY_ANCHOR: process.env.NEXT_PUBLIC_MEMORY_ANCHOR,
     NEXT_PUBLIC_RPC_URL: process.env.NEXT_PUBLIC_RPC_URL,
   },
 });
