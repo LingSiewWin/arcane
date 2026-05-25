@@ -19,6 +19,26 @@ from typing import Optional
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def peek_env(path: Optional[Path | str] = None) -> dict[str, str]:
+    """Parse `path` (default repo-root `.env`) and RETURN its key/values WITHOUT
+    mutating os.environ. Use this when you only need to check whether a value is
+    present (e.g. a test skip-gate) and must not pollute the process environment
+    for other tests. Missing file → {}."""
+    env_path = Path(path) if path else REPO_ROOT / ".env"
+    if not env_path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key:
+            out[key] = value.strip().strip('"').strip("'")
+    return out
+
+
 def load_env(path: Optional[Path | str] = None, *, override: bool = False) -> dict[str, str]:
     """Load `path` (default: repo-root `.env`) into os.environ. Returns the dict
     of keys it set. Missing file is a no-op (returns {})."""
