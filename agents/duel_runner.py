@@ -308,13 +308,26 @@ class DuelRunner:
     class is testable; the CLI wires it to in-process signing. Each agent is a
     real ``Duelist`` (LLM); the cycle scores its actual decisions."""
 
-    def __init__(self, config: DuelConfig, send_fn, *, real_move_fn=None) -> None:
+    def __init__(
+        self,
+        config: DuelConfig,
+        send_fn,
+        *,
+        real_move_fn=None,
+        anchor_fn=None,
+        anchor_every: int = 3,
+    ) -> None:
         self.config = config
         # send_fn(to_addr, data_hex) -> receipt dict (with logs + status).
         self._send = send_fn
         # real_move_fn(cycle) -> forward move in bps for this cycle. In live mode
         # this is the Pyth-resolved forward return; tests inject a price path.
         self._real_move = real_move_fn or (lambda c: 0)
+        # anchor_fn(agent_address, root_bytes) -> None: persist an agent's memory
+        # root on-chain. The arena wires this to the agent's OWN key + identity
+        # (the agent owns its ERC-8004 identity). None = no anchoring.
+        self._anchor = anchor_fn
+        self.anchor_every = int(anchor_every)
         self.duel_id: Optional[int] = None
 
     def register_agents(self) -> None:
@@ -405,6 +418,10 @@ class DuelRunner:
                     self.duel_id, agent.address, cycle, ingested, survived, reasoning
                 ),
             )
+            # Persist this cycle's reasoning to the agent's own RaBitQ memory
+            # ONCE (recall already happened read-only inside decide()); no-op if
+            # the agent has no memory wired.
+            agent.remember(cycle, reasoning, direction, r_bps)
             out.append(
                 CycleReport(
                     cycle=cycle,
@@ -418,6 +435,13 @@ class DuelRunner:
                     tx_hash=receipt.get("transactionHash"),
                 )
             )
+
+        # Periodically anchor each agent's memory root on-chain (agent-owned).
+        if self._anchor is not None and self.anchor_every > 0 and cycle % self.anchor_every == 0:
+            for agent in (self.config.agent_a, self.config.agent_b):
+                root = agent.memory_root()
+                if root:
+                    self._anchor(agent.address, root)
         return out
 
     def resolve(self) -> dict:

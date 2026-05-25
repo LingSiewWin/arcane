@@ -24,7 +24,11 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    from agents.embedder import Embedder
+    from agents.memory_service import MemoryService
 
 # Provider defaults. The model is configurable per duel; these are only used when
 # no explicit model is given. OpenRouter takes a routed slug (provider/model);
@@ -104,30 +108,120 @@ class Duelist:
         model: Optional[str] = None,
         complete_fn: Optional[Callable[[str, str], str]] = None,
         max_tokens: int = 256,
+        memory: Optional["MemoryService"] = None,
+        embedder: Optional["Embedder"] = None,
+        recall_k: int = 3,
+        persona: str = "",
     ) -> None:
         self.address = address
         self.hardened = hardened
+        # Optional strategy descriptor appended to the system prompt, so an arena
+        # of N agents is a real competition (e.g. "momentum-chasing" vs
+        # "mean-reverting") rather than N identical bots. Empty = no persona.
+        self.persona = persona
         # None → resolved to the active provider's default at call time.
         self.model = model
         self.max_tokens = max_tokens
         self._complete = complete_fn or self._default_complete
+        # Per-agent RaBitQ working memory. Active only when BOTH a memory store
+        # and an embedder are supplied; otherwise decide() behaves exactly as
+        # before (back-compat). No set_centroid() call is needed at init — the
+        # MemoryService arms a zero-origin centroid on its first add(), so the
+        # first remember() never raises.
+        self.memory = memory
+        self.embedder = embedder
+        self.recall_k = int(recall_k)
+
+    @property
+    def _memory_active(self) -> bool:
+        """Memory features engage only when both halves are wired."""
+        return self.memory is not None and self.embedder is not None
 
     def system_prompt(self, symbol: str) -> str:
         prompt = BASE_SYSTEM.format(symbol=symbol.upper())
         if self.hardened:
             prompt += HARDENED_CLAUSE
+        if self.persona:
+            prompt += f"\n\nYOUR STRATEGY: {self.persona}"
         return prompt
 
     def decide(
         self, symbol: str, market_brief: str, injection_text: Optional[str] = None
     ) -> Decision:
         """Return the agent's committed call for this cycle. Raises DuelistError
-        on an unusable model response (the runner maps that to the penalty path)."""
+        on an unusable model response (the runner maps that to the penalty path).
+
+        If memory is active, the agent first RECALLS its top-k past reasoning
+        (read-only top-k query keyed on the market brief) and prepends it to the
+        user prompt. Recall NEVER writes — the counterfactual runner may call
+        decide() twice per cycle (clean + dirty), so storing here would double-
+        count. Persistence happens once per cycle via remember()."""
         user = market_brief
         if injection_text:
             user = f"{market_brief}\n\n{injection_text}"
+
+        recalled = self._recall_block(market_brief)
+        if recalled:
+            user = f"{recalled}\n\n{user}"
+
         raw = self._complete(self.system_prompt(symbol), user)
         return parse_decision(raw)
+
+    def _recall_block(self, market_brief: str) -> str:
+        """Build the (possibly empty) 'recent reasoning' block from memory.
+
+        Read-only: embeds the brief, queries the top-k hits, and pulls each
+        hit's stored reasoning text from its payload. Returns "" when memory is
+        inactive or empty (so decide() prepends nothing)."""
+        if not self._memory_active:
+            return ""
+        vec = self.embedder.embed(market_brief)
+        hits = self.memory.query(vec, k=self.recall_k)
+        lines: list[str] = []
+        for trace_id, _score in hits:
+            entry = self.memory.entries.get(trace_id)
+            if entry is None:
+                continue
+            text = str(entry.payload.get("text", "")).strip()
+            if text:
+                lines.append(f"- {text}")
+        if not lines:
+            return ""
+        return "Your recent reasoning (memory):\n" + "\n".join(lines)
+
+    def remember(
+        self, cycle: int, reasoning: str, direction: int, r_bps: int
+    ) -> None:
+        """STORE this cycle's reasoning into memory (called ONCE per cycle by
+        the runner, never inside decide()). Pinned so it contributes to the
+        Merkle root we anchor on-chain. No-op when memory is inactive."""
+        if not self._memory_active:
+            return
+        vec = self.embedder.embed(reasoning)
+        self.memory.add(
+            trace_id=f"trace:{cycle}",
+            vec=vec,
+            kind="episodic",
+            pinned=True,
+            payload={
+                "text": reasoning,
+                "direction": int(direction),
+                "r_bps": int(r_bps),
+            },
+        )
+
+    def memory_root(self) -> bytes:
+        """Pinned Merkle root over stored reasoning (32 bytes), or b"" when there
+        is nothing to anchor — either no memory store attached, OR no pinned
+        entries yet. Returning b"" for the empty case keeps the runner from
+        anchoring the empty-tree sentinel (sha256(b"")) as a real on-chain tx."""
+        if self.memory is None or not self.memory.pinned_ids():
+            return b""
+        return self.memory.pinned_merkle_root()
+
+    def memory_stats(self) -> Optional[dict]:
+        """Passthrough to the memory store's footprint stats, or None."""
+        return self.memory.memory_stats() if self.memory is not None else None
 
     def _default_complete(self, system: str, user: str) -> str:
         """Provider dispatch, resolved lazily so unit tests (which inject
@@ -175,7 +269,13 @@ def _openrouter_complete(system: str, user: str, model: str, max_tokens: int) ->
     )
     resp.raise_for_status()
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    # Validate the shape rather than blindly indexing — an OpenRouter error body
+    # (e.g. rate limit) has no `choices`; surface a clean DuelistError (→ the
+    # runner's penalty path) instead of a raw KeyError that could echo the body.
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise DuelistError("OpenRouter returned an unexpected response shape") from exc
 
 
 def _anthropic_complete(system: str, user: str, model: str, max_tokens: int) -> str:

@@ -205,6 +205,44 @@ def test_decode_chaos_log_builds_injection():
     assert inj.claimed_move_bps != 0  # flashbang template applied
 
 
+def test_run_cycle_remembers_and_anchors():
+    """Memory-augmented agents store one trace per cycle and the runner anchors
+    each agent's memory root every `anchor_every` cycles."""
+    from agents.embedder import Embedder
+    from agents.memory_service import MemoryService
+
+    send, _ = _capturing_sender()
+    A = Duelist(
+        AGENT_A, hardened=True,
+        complete_fn=lambda s, u: '{"direction":"long","reasoning":"a"}',
+        memory=MemoryService(dim=384), embedder=Embedder(model_name=None),
+    )
+    B = Duelist(
+        AGENT_B, hardened=False,
+        complete_fn=lambda s, u: '{"direction":"short","reasoning":"b"}',
+        memory=MemoryService(dim=384), embedder=Embedder(model_name=None),
+    )
+    anchors: list[tuple[str, bytes]] = []
+    runner = DuelRunner(
+        DuelConfig("0xC0", A, B, symbol="SOL"),
+        send,
+        real_move_fn=lambda c: 100,
+        anchor_fn=lambda addr, root: anchors.append((addr, root)),
+        anchor_every=2,
+    )
+    runner.duel_id = 1
+    runner.run_cycle(1)  # 1 % 2 != 0 → no anchor
+    assert anchors == []
+    runner.run_cycle(2)  # 2 % 2 == 0 → anchor both
+    # Each agent stored exactly one trace per cycle.
+    assert A.memory_stats()["entries"] == 2
+    assert B.memory_stats()["entries"] == 2
+    # Both agents anchored once, with real 32-byte roots.
+    assert len(anchors) == 2
+    assert {a for a, _ in anchors} == {AGENT_A, AGENT_B}
+    assert all(isinstance(r, bytes) and len(r) == 32 for _, r in anchors)
+
+
 # ---------------------------------------------------------------------------
 # Anvil-fork integration: real Colosseum, real duel
 # ---------------------------------------------------------------------------
