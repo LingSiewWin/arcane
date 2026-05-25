@@ -9,7 +9,7 @@ import { ModeToggle } from "./mode-toggle";
 const NAV = [
   { href: "/arena", label: "arena" },
   { href: "/colosseum", label: "colosseum" },
-  { href: "/", label: "single run" },
+  { href: "/console", label: "single run" },
 ] as const;
 
 function isActive(pathname: string, href: string): boolean {
@@ -23,7 +23,7 @@ export default function Header() {
     <header className="border-b border-border/60 bg-card/30 backdrop-blur">
       <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-4 px-4 py-2 sm:px-6">
         <div className="flex items-center gap-5">
-          <Link href="/arena" className="flex items-center gap-2">
+          <Link href="/" className="flex items-center gap-2">
             <span className="size-2 rounded-full bg-primary" />
             <span className="font-mono text-xs tracking-tight">agent-arena</span>
             <span className="hidden font-mono text-[10px] text-muted-foreground sm:inline">

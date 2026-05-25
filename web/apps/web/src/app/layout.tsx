@@ -1,10 +1,7 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
-
-import { TooltipProvider } from "@web/ui/components/tooltip";
+import { Geist, Geist_Mono, Readex_Pro } from "next/font/google";
 
 import "../index.css";
-import Header from "@/components/header";
 import Providers from "@/components/providers";
 
 const geistSans = Geist({
@@ -14,6 +11,12 @@ const geistSans = Geist({
 
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+const readexPro = Readex_Pro({
+  variable: "--font-readex-pro",
+  weight: ["300", "400", "500", "600", "700"],
   subsets: ["latin"],
 });
 
@@ -30,15 +33,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
-        <Providers>
-          <TooltipProvider>
-            <div className="grid h-svh grid-rows-[auto_1fr]">
-              <Header />
-              <div className="min-h-0 overflow-y-auto">{children}</div>
-            </div>
-          </TooltipProvider>
-        </Providers>
+      <body
+        className={`${geistSans.variable} ${geistMono.variable} ${readexPro.variable} antialiased`}
+      >
+        <Providers>{children}</Providers>
       </body>
     </html>
   );
