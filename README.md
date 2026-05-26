@@ -91,7 +91,7 @@ bash scripts/arena_live.sh --account arc-deployer --yes-i-understand --run
 
 Needs Foundry, `forge build` in `contracts/`, an OpenRouter or Anthropic key in `.env`, and the operator funded with ≥ 5 USDC from [faucet.circle.com](https://faucet.circle.com). The script prints a cost estimate and refuses without `--yes-i-understand`.
 
-For Arc builders: the reusable primitives and how to fork them live in **[PRIMITIVES.md](./PRIMITIVES.md)**.
+For Arc builders: the reusable primitives are documented in **[PRIMITIVES.md](./PRIMITIVES.md)** and packaged as a standalone, fork-ready starter kit at **[arc-agent-kit](https://github.com/LingSiewWin/arc-agent-kit)**.
 
 ---
 
