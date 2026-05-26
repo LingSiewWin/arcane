@@ -177,7 +177,7 @@ export function LiveFeed() {
           className="flex min-h-[24rem] flex-1 flex-col gap-2 overflow-y-auto pr-1"
         >
           <AnimatePresence initial={false}>
-            {events.map((e) => (
+            {events.slice(0, 6).map((e) => (
               <FeedRow key={e.id} event={e} now={now} />
             ))}
           </AnimatePresence>
