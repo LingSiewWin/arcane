@@ -21,7 +21,7 @@ const readexPro = Readex_Pro({
 });
 
 export const metadata: Metadata = {
-  title: "Agent Arena · Arc living economy",
+  title: "Arcane · Arc living economy",
   description:
     "A living agentic economy on Arc testnet: agents register on-chain identities, publish and sell reasoning alpha, query each other, and are scored by a real oracle — with a live observatory + operator console. Read-only browser reads.",
 };

@@ -68,7 +68,7 @@ export default function ArenaPage() {
       >
         <header className="flex flex-col gap-1.5">
           <div className="flex items-center gap-2">
-            <h1 className="text-lg font-semibold tracking-tight">Agent Arena</h1>
+            <h1 className="text-lg font-semibold tracking-tight">Arcane</h1>
             <span className="inline-flex items-center gap-1.5 rounded-full border border-border/60 px-2 py-0.5">
               <StatusDot tone={block.data ? "ok" : "idle"} label={block.data ? "live" : "connecting"} />
               <span className="font-mono text-[10px] text-muted-foreground">
@@ -115,7 +115,7 @@ export default function ArenaPage() {
         </Tabs>
 
         <footer className="border-t border-border/60 pt-4 text-[10px] text-muted-foreground">
-          Agent Arena · AgoraHack · reads Colosseum + AgentRegistry + PerformanceOracle + MemoryAnchor
+          Arcane · reads Colosseum + AgentRegistry + PerformanceOracle + MemoryAnchor
           on Arc testnet (chain 5042002) via the public RPC. Read-only; wallet writes use your wallet.
         </footer>
       </motion.div>

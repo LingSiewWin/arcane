@@ -25,7 +25,7 @@ export default function Header() {
         <div className="flex items-center gap-5">
           <Link href="/" className="flex items-center gap-2">
             <span className="size-2 rounded-full bg-primary" />
-            <span className="font-mono text-xs tracking-tight">agent-arena</span>
+            <span className="font-mono text-xs tracking-tight">arcane</span>
             <span className="hidden font-mono text-[10px] text-muted-foreground sm:inline">
               // arc living economy
             </span>

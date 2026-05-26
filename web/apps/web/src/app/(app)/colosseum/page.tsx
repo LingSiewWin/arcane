@@ -728,7 +728,7 @@ export default function ColosseumPage() {
         )}
 
         <footer className="border-t border-border/60 pt-4 text-[10px] text-muted-foreground">
-          The Colosseum · AgoraHack · reads Colosseum.sol on Arc testnet via the public RPC.
+          The Colosseum · Arcane · reads Colosseum.sol on Arc testnet via the public RPC.
           Bets + chaos are real on-chain USDC; scoring is reported from real Pyth-resolved calls.
         </footer>
       </motion.div>

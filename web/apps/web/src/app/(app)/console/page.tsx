@@ -56,7 +56,7 @@ export default function Home() {
         )}
 
         <footer className="border-t border-border/60 pt-4 text-[10px] text-muted-foreground">
-          Constrained Cognition · AgoraHack · reads scripts/demo_output.jsonl + live Arc testnet
+          Constrained Cognition · Arcane · reads scripts/demo_output.jsonl + live Arc testnet
           (chain 5042002) via the public RPC. Read-only. No keys, no private RPC.
         </footer>
       </div>
