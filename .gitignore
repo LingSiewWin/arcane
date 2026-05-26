@@ -38,3 +38,6 @@ image.png
 
 # editor-local workspace settings (personal, not shared)
 .vscode/
+
+test-landing/
+.superpowers/
