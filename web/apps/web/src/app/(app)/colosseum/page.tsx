@@ -13,7 +13,7 @@ import { Input } from "@web/ui/components/input";
 import { ConnectWallet } from "@/components/connect-wallet";
 import { ArenaEmpty } from "@/components/arena/arena-empty";
 import { PanelTitle, StatusDot, TxLink } from "@/components/panels/primitives";
-import { arcTestnet } from "@/lib/chain";
+import { ARC_EXPLORER, ARC_RPC_URL, arcTestnet } from "@/lib/chain";
 import {
   COLOSSEUM,
   COLOSSEUM_CONFIGURED,
@@ -97,6 +97,26 @@ const erc20ApproveAbi = [
     outputs: [{ type: "bool" }],
   },
 ] as const;
+
+/** Circle's testnet faucet for test USDC — static link, no balance read. */
+const FAUCET_URL = "https://faucet.circle.com";
+
+/**
+ * Params wagmi passes to `wallet_addEthereumChain` so a wallet that doesn't yet
+ * know Arc can ADD it before switching (plain switchChain throws otherwise).
+ * nativeCurrency uses 18 decimals (Arc gas USDC), distinct from the 6-decimal
+ * ERC-20 settlement USDC.
+ */
+const ARC_ADD_CHAIN_PARAMETER = {
+  chainName: arcTestnet.name,
+  nativeCurrency: {
+    name: arcTestnet.nativeCurrency.name,
+    symbol: arcTestnet.nativeCurrency.symbol,
+    decimals: arcTestnet.nativeCurrency.decimals,
+  },
+  rpcUrls: [ARC_RPC_URL],
+  blockExplorerUrls: [ARC_EXPLORER],
+};
 
 function ResilienceBar({ agent }: { agent: `0x${string}` }) {
   const r = useResilience(agent);
@@ -356,6 +376,34 @@ function parseUsdc(value: string): bigint {
   }
 }
 
+/** Compact 3-step onboarding hint + a static link to Circle's test-USDC faucet. */
+function HowToPlay() {
+  return (
+    <div className="flex w-full flex-col gap-1.5 border-t border-border/50 pt-3 text-left">
+      <span className="text-[10px] uppercase tracking-wider text-muted-foreground">how to play</span>
+      <ol className="flex flex-col gap-1 font-mono text-[10px] text-muted-foreground">
+        <li>
+          <span className="text-[--color-signal]">1.</span> Connect your wallet
+        </li>
+        <li>
+          <span className="text-[--color-signal]">2.</span> Add Arc + get test USDC from the{" "}
+          <a
+            href={FAUCET_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="text-foreground underline hover:text-[--color-signal]"
+          >
+            Circle faucet
+          </a>
+        </li>
+        <li>
+          <span className="text-[--color-signal]">3.</span> Approve, then inject chaos or bet
+        </li>
+      </ol>
+    </div>
+  );
+}
+
 function AttackAndBet({ duel }: { duel: Duel }) {
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -372,6 +420,10 @@ function AttackAndBet({ duel }: { duel: Duel }) {
   const { phase } = duelPhase(duel, now);
   const canBet = phase === "betting";
   const canInject = phase === "trading";
+  // The viewed duel resolved (status 2) — the runner opens a fresh duel and
+  // useActiveDuel (highest duelCount) swaps it in on the next poll. Until then any
+  // inject/bet would target the resolved duel and revert, so block + note.
+  const duelResolved = duel.status === 2 || phase === "resolved";
 
   const allowance = allowanceQ.data ?? BigInt(0);
   const betUnits = parseUsdc(betAmt);
@@ -428,6 +480,7 @@ function AttackAndBet({ duel }: { duel: Duel }) {
           writes to the Colosseum on Arc.
         </p>
         <ConnectWallet />
+        <HowToPlay />
       </Card>
     );
   }
@@ -435,9 +488,30 @@ function AttackAndBet({ duel }: { duel: Duel }) {
     return (
       <Card className="flex flex-col items-center gap-3 p-5 text-center">
         <p className="text-xs text-[--color-alarm]">Wrong network — switch to Arc ({arcTestnet.id}).</p>
-        <Button size="sm" variant="outline" onClick={() => switchChain({ chainId: arcTestnet.id })}>
-          Switch to Arc
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() =>
+            // Add-then-switch: addEthereumChainParameter so wallets that don't yet
+            // know Arc add it instead of throwing. No-op when Arc is already known.
+            switchChain({ chainId: arcTestnet.id, addEthereumChainParameter: ARC_ADD_CHAIN_PARAMETER })
+          }
+        >
+          Add &amp; switch to Arc
         </Button>
+        <HowToPlay />
+      </Card>
+    );
+  }
+  if (duelResolved) {
+    return (
+      <Card className="flex flex-col items-center gap-3 p-5 text-center">
+        <PanelTitle index="·" title="Attack & bet" subtitle="duel settled" />
+        <p className="max-w-xs text-xs text-muted-foreground">
+          This duel just ended — a new one is live. Hang tight; the arena loads the fresh duel in a
+          moment, then you can inject chaos and bet again.
+        </p>
+        <HowToPlay />
       </Card>
     );
   }
@@ -608,8 +682,14 @@ function ClaimPanel({ duel }: { duel: Duel }) {
               : "Claim your pro-rata share of the whole pot."}
           </p>
           {wrongNet ? (
-            <Button size="sm" variant="outline" onClick={() => switchChain({ chainId: arcTestnet.id })}>
-              Switch to Arc to claim
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                switchChain({ chainId: arcTestnet.id, addEthereumChainParameter: ARC_ADD_CHAIN_PARAMETER })
+              }
+            >
+              Add &amp; switch to Arc to claim
             </Button>
           ) : (
             <Button
@@ -639,6 +719,7 @@ function ClaimPanel({ duel }: { duel: Duel }) {
           {(error as { shortMessage?: string }).shortMessage ?? "transaction failed"}
         </p>
       ) : null}
+      <HowToPlay />
     </Card>
   );
 }
