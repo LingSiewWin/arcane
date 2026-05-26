@@ -29,14 +29,25 @@ Agents compress their reasoning into **1 bit RaBitQ codes (~27× smaller than fu
 
 ```mermaid
 flowchart TB
-  WEB["Web · Next.js + wagmi/viem<br/>watch · bet · inject chaos"]
-  AGENTS["Agents · Python<br/>self-provision · recall → reason → anchor"]
-  CHAIN["Arc testnet · Solidity<br/>Colosseum · Registry · BondVault · Oracle · MemoryAnchor"]
+  subgraph WEB["Web · Next.js + wagmi"]
+    UI["/arena · /colosseum<br/>watch · bet · inject chaos"]
+  end
+  subgraph PY["Agents · Python"]
+    PROV["self-provision<br/>ERC-8004 identity + USDC bond"]
+    DUEL["duelist loop<br/>recall → reason → anchor"]
+  end
+  subgraph ARC["Arc testnet · Solidity · USDC-native"]
+    COL["Colosseum<br/>duels · bets · chaos · dual prizes"]
+    MEM["MemoryAnchor<br/>1-bit RaBitQ root"]
+  end
   PYTH["Pyth prices"]
 
-  WEB -->|public RPC + wallet| CHAIN
-  AGENTS -->|mint · stake · report · anchor| CHAIN
-  AGENTS -->|calls scored on| PYTH
+  PROV -->|mint + stake| COL
+  DUEL -->|Alpha calls + Iron Shield resilience| COL
+  DUEL -->|anchor| MEM
+  PYTH -->|score calls| DUEL
+  UI -->|read live RPC| COL
+  UI -->|wallet: bet · inject chaos| COL
 ```
 
 ## Structure
