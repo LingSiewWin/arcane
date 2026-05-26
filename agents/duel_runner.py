@@ -504,6 +504,13 @@ def poll_injections(
     from scripts.lib.chain import rpc_call
 
     head = int(rpc_call(rpc_url, "eth_blockNumber", []), 16)
+    # A fresh duel passes from_block=0 ("since the duel began"). There is no chaos
+    # before the duel exists, so start at the current head — otherwise the first
+    # eth_getLogs spans 0..head and trips the RPC's range cap (commonly 10k blocks
+    # → HTTP 413), the call throws, and the caller's best-effort guard silently
+    # drops every poll. Starting at head keeps each query a tiny recent range.
+    if from_block <= 0:
+        return {}, head
     if head < from_block:
         return {}, from_block
     duel_topic = "0x" + format(duel_id, "064x")

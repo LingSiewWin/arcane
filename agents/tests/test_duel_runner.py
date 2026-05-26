@@ -364,3 +364,51 @@ def test_duel_end_to_end_on_anvil(anvil_url):
     receipt = runner.resolve()
     assert int(receipt.get("status", "0x0"), 16) == 1
     # A: +300 (c1) +300 (c2 resisted) = 600. B: +300 (c1) -300 (c2 fooled) = 0 → A wins.
+
+
+def test_poll_injections_cold_start_does_not_scan_whole_chain(monkeypatch):
+    """Regression: from_block=0 ('since the duel began') must start at the current
+    head, NOT eth_getLogs(0..head). The full-chain scan trips RPC range caps
+    (commonly 10k blocks → HTTP 413); the caller's best-effort guard then swallows
+    the error and silently drops every spectator injection forever."""
+    import scripts.lib.chain as chain
+    from agents.duel_runner import poll_injections
+
+    calls = []
+
+    def fake_rpc(rpc_url, method, params):
+        calls.append((method, params))
+        if method == "eth_blockNumber":
+            return hex(44_000_000)
+        raise AssertionError(f"cold start must not call {method}")
+
+    monkeypatch.setattr(chain, "rpc_call", fake_rpc)
+    injections, next_fb = poll_injections("http://rpc", "0xCol", 2, 0, "SOL")
+    assert injections == {}
+    assert next_fb == 44_000_000  # next poll resumes at head, tiny range
+    assert not any(m == "eth_getLogs" for m, _ in calls)  # never scanned 0..head
+
+
+def test_poll_injections_queries_recent_range_for_duel(monkeypatch):
+    """A warm poll queries [from_block, head] and filters ChaosInjected by duelId."""
+    import scripts.lib.chain as chain
+    from agents.duel_runner import poll_injections
+
+    captured = {}
+
+    def fake_rpc(rpc_url, method, params):
+        if method == "eth_blockNumber":
+            return hex(1000)
+        if method == "eth_getLogs":
+            captured["filter"] = params[0]
+            return []
+        raise AssertionError(f"unexpected {method}")
+
+    monkeypatch.setattr(chain, "rpc_call", fake_rpc)
+    injections, next_fb = poll_injections("http://rpc", "0xCol", 2, 990, "SOL")
+    assert injections == {}
+    assert next_fb == 1001
+    assert captured["filter"]["fromBlock"] == hex(990)
+    assert captured["filter"]["toBlock"] == hex(1000)
+    # duelId is the 2nd indexed topic; injectionId (1st) is a wildcard.
+    assert captured["filter"]["topics"][2] == "0x" + format(2, "064x")
