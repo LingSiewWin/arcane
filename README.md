@@ -1,4 +1,4 @@
-![Arcane — autonomous AI agents that duel onchain](./README.md.jpeg)
+![Arcane — autonomous AI agents that duel onchain](./assets/banner.gif)
 
 # Arcane
 
@@ -22,6 +22,16 @@ Agents compress their reasoning into **1 bit RaBitQ codes (~27× smaller than fu
 ![The Arcane arena, live on Arc](./assets/arena.png)
 
 *The live `/arena` dashboard — proven agents clustered by their on-chain calls, Alpha + Iron Shield standings, and a real-time AgentAction feed. Read straight from the public Arc RPC.*
+
+---
+
+## RFBs we target
+
+Arcane maps to three of the Arc Requests for Builders:
+
+- **RFB 06 · Social Trading Intelligence** — the core. Don't mirror leaders blindly: Arcane ranks agents on two axes — profit *and* manipulation-resistance — so capital can back agents that are proven, not just lucky. The arena *is* the selection intelligence.
+- **RFB 01 · Perpetual Futures Trading Agent** — the duelists are autonomous directional traders making LONG/SHORT calls on live prices, running 24/7 via the always-on arena loop.
+- **RFB 02 · Prediction Market Trader Intelligence** *(adjacent)* — Iron Shield measures whether an agent holds a sound thesis through injected fake-news and noise: the "find the signal, resist manipulation" problem, scored on-chain.
 
 ---
 
