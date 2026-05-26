@@ -171,3 +171,121 @@ def test_arena_carries_injected_symbol_and_cycles():
     arena, _ = _assemble(wallets, symbol="eth", cycles=7)
     assert arena.symbol == "eth"
     assert arena.cycles == 7
+
+
+# ---------------------------------------------------------------------------
+# Task 6 — fixed agent-pool REUSE: when --reuse-keystores is supplied, main()
+# must load the existing pool and NEVER spawn or provision (zero USDC/gas spend).
+# Fully offline: spawn/provision/assemble/arena.run are all faked; no network,
+# no provider key beyond the env gate, no torch.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResult:
+    """Minimal stand-in for ArenaResult that _format_rankings can render."""
+
+    duel_ids = [1, 2]
+
+    def alpha_ranking(self):
+        return []
+
+    def shield_ranking(self):
+        return []
+
+
+class _FakeArena:
+    def run(self, duelists):
+        return _FakeResult()
+
+
+def _set_live_env(monkeypatch):
+    """Satisfy main()'s env gates without any real secret/network."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-used-offline")
+    monkeypatch.setenv("DEPLOYER_PK", "0x" + "11" * 32)
+    monkeypatch.setenv("ARENA_RPC_URL", "http://offline.invalid")
+
+
+def test_reuse_keystores_skips_spawn_and_provision(monkeypatch, tmp_path):
+    """With --reuse-keystores, main() loads the pool and makes NO spawn/provision
+    calls — the whole point of pool reuse (no USDC/gas, no provisioning gap)."""
+    _set_live_env(monkeypatch)
+
+    calls = {"spawn": 0, "provision": 0, "load": 0}
+
+    def fake_load(*, keystore_dir=None, password=None):
+        calls["load"] += 1
+        assert str(keystore_dir) == str(tmp_path)
+        return _wallets()  # 4 pre-provisioned wallets (all carry identity_id)
+
+    def fake_spawn(*a, **k):
+        calls["spawn"] += 1
+        raise AssertionError("spawn_keypairs must NOT be called on the reuse path")
+
+    def fake_provision(*a, **k):
+        calls["provision"] += 1
+        raise AssertionError("provision_agents must NOT be called on the reuse path")
+
+    def fake_assemble(wallets, **kwargs):
+        # Reuse path must hand the LOADED wallets straight to assembly.
+        assert [w.address for w in wallets] == [w.address for w in _wallets()]
+        return _FakeArena(), [object() for _ in wallets]
+
+    monkeypatch.setattr(run_arena, "load_agent_wallets", fake_load)
+    monkeypatch.setattr(run_arena, "spawn_keypairs", fake_spawn)
+    monkeypatch.setattr(run_arena, "provision_agents", fake_provision)
+    monkeypatch.setattr(run_arena, "assemble", fake_assemble)
+
+    rc = run_arena.main([
+        "--colosseum", "0xC0FFEE0000000000000000000000000000000001",
+        "--memory-anchor", "0xA11CE00000000000000000000000000000000002",
+        "--reuse-keystores", str(tmp_path),
+    ])
+
+    assert rc == 0
+    assert calls["load"] == 1, "the reuse path must load the existing pool exactly once"
+    assert calls["spawn"] == 0, "NO spawn on reuse"
+    assert calls["provision"] == 0, "NO provision on reuse"
+
+
+def test_fresh_path_spawns_and_provisions_and_persists_identities(monkeypatch, tmp_path):
+    """Control: WITHOUT --reuse-keystores the fresh path spawns + provisions (and
+    does NOT call load), and saves the identities sidecar so the pool is reusable."""
+    _set_live_env(monkeypatch)
+
+    calls = {"spawn": 0, "provision": 0, "load": 0, "save": 0}
+
+    provisioned = _wallets()
+
+    def fake_spawn(n, *a, **k):
+        calls["spawn"] += 1
+        return provisioned
+
+    def fake_provision(wallets, **k):
+        calls["provision"] += 1
+        return list(wallets)
+
+    def fake_load(*a, **k):
+        calls["load"] += 1
+        raise AssertionError("load_agent_wallets must NOT be called on the fresh path")
+
+    def fake_save(wallets, **k):
+        calls["save"] += 1
+        return tmp_path / "identities.json"
+
+    monkeypatch.setattr(run_arena, "spawn_keypairs", fake_spawn)
+    monkeypatch.setattr(run_arena, "provision_agents", fake_provision)
+    monkeypatch.setattr(run_arena, "load_agent_wallets", fake_load)
+    monkeypatch.setattr(run_arena, "save_identities", fake_save)
+    monkeypatch.setattr(run_arena, "assemble", lambda w, **kw: (_FakeArena(), list(w)))
+
+    rc = run_arena.main([
+        "--colosseum", "0xC0FFEE0000000000000000000000000000000001",
+        "--memory-anchor", "0xA11CE00000000000000000000000000000000002",
+        "--agents", "4",
+    ])
+
+    assert rc == 0
+    assert calls["spawn"] == 1
+    assert calls["provision"] == 1
+    assert calls["save"] == 1, "the fresh pool's identities must be persisted for reuse"
+    assert calls["load"] == 0

@@ -28,7 +28,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 from eth_account import Account
 
@@ -42,6 +42,13 @@ DEFAULT_KEYSTORE_DIR = Path(__file__).resolve().parent / ".arena_keystore"
 # the ``KEYSTORE_PASSWORD`` convention used by ``scripts/lib/keys.py``, with an
 # arena-specific override taking precedence.
 _PASSWORD_ENV_VARS = ("ARENA_KEY_PASSWORD", "KEYSTORE_PASSWORD")
+
+# Non-secret sidecar mapping ``checksummed address -> ERC-8004 identity_id``.
+# The encrypted keystores hold ONLY the key material (Secret Storage format) and
+# carry no identity id, so a reused pool would lose the minted identity_ids that
+# the per-agent ``anchor_fn`` needs. We persist them next to the keystores in a
+# plaintext JSON — it contains NO secret (the identity id is public on-chain).
+IDENTITIES_FILENAME = "identities.json"
 
 
 class AgentKeyError(RuntimeError):
@@ -148,6 +155,68 @@ def spawn_keypairs(
     return wallets
 
 
+def save_identities(
+    wallets: Sequence[AgentWallet],
+    *,
+    keystore_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Persist the ``address -> identity_id`` map for a provisioned pool.
+
+    Writes (or merges into) ``<keystore_dir>/identities.json`` so a later REUSE
+    of this pool can recover each agent's minted ERC-8004 identity id (the
+    encrypted keystores do not carry it). Only wallets with a non-``None``
+    ``identity_id`` are recorded. The file holds NO secret — the identity id is
+    public on-chain — so it is written plaintext (not gitignored material).
+
+    Returns the path written. Existing entries for addresses not in ``wallets``
+    are preserved (merge, not overwrite).
+    """
+    ks_dir = _resolve_keystore_dir(keystore_dir)
+    ks_dir.mkdir(parents=True, exist_ok=True)
+    path = ks_dir / IDENTITIES_FILENAME
+
+    mapping: dict[str, int] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+            if isinstance(existing, dict):
+                mapping.update({str(k): int(v) for k, v in existing.items()})
+        except (OSError, ValueError, TypeError):
+            # A corrupt sidecar is non-fatal: we just rebuild it from `wallets`.
+            mapping = {}
+
+    for w in wallets:
+        if w.identity_id is not None:
+            mapping[w.address] = int(w.identity_id)
+
+    path.write_text(json.dumps(mapping, indent=2, sort_keys=True))
+    return path
+
+
+def _load_identities(ks_dir: Path) -> dict[str, int]:
+    """Read the ``identities.json`` sidecar (address -> identity_id), if present.
+
+    Returns an empty dict when the sidecar is absent or malformed. Keys are
+    lowercased for case-insensitive address matching.
+    """
+    path = ks_dir / IDENTITIES_FILENAME
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        try:
+            out[str(k).lower()] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def load_agent_wallets(
     *,
     password: Optional[str] = None,
@@ -157,8 +226,11 @@ def load_agent_wallets(
 
     Reads each keystore JSON, decrypts via ``Account.decrypt(json, password)``
     to recover the private key, and derives the address with
-    ``Account.from_key(pk).address``. Returns the wallets sorted by checksummed
-    address for determinism.
+    ``Account.from_key(pk).address``. If an ``identities.json`` sidecar is present
+    (written by ``save_identities`` at provision time), each wallet's
+    ``identity_id`` is populated from it — so a REUSED pool keeps the minted
+    ERC-8004 identity the per-agent ``anchor_fn`` needs. Returns the wallets
+    sorted by checksummed address for determinism.
 
     Raises ``AgentKeyError`` if the dir is missing, a keystore is malformed, or
     the password is wrong (the password is never logged).
@@ -168,6 +240,8 @@ def load_agent_wallets(
 
     if not ks_dir.exists():
         raise AgentKeyError(f"keystore dir not found: {ks_dir}")
+
+    identities = _load_identities(ks_dir)
 
     wallets: list[AgentWallet] = []
     for path in sorted(ks_dir.glob("*.keystore")):
@@ -191,7 +265,13 @@ def load_agent_wallets(
 
         pk_hex = "0x" + bytes(key_bytes).hex()
         address = Account.from_key(pk_hex).address
-        wallets.append(AgentWallet(address=address, private_key=pk_hex))
+        wallets.append(
+            AgentWallet(
+                address=address,
+                private_key=pk_hex,
+                identity_id=identities.get(address.lower()),
+            )
+        )
 
     wallets.sort(key=lambda w: w.address.lower())
     return wallets

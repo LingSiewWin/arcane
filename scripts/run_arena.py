@@ -35,7 +35,13 @@ from typing import Callable, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from agents.agent_wallet import AgentWallet, spawn_keypairs  # noqa: E402
+from agents.agent_wallet import (  # noqa: E402
+    AgentKeyError,
+    AgentWallet,
+    load_agent_wallets,
+    save_identities,
+    spawn_keypairs,
+)
 from agents.arena import Arena  # noqa: E402
 from agents.duel_runner import SOL_USD_FEED, SYMBOL_FEEDS, PythScorer  # noqa: E402
 from agents.duelist import Duelist  # noqa: E402
@@ -161,6 +167,85 @@ def assemble(
     return arena, duelists
 
 
+def acquire_pool(
+    *,
+    reuse_keystores: Optional[str],
+    agents: int,
+    rpc_url: str,
+    operator_pk: str,
+    colosseum: str,
+    fund_usdc: float,
+    stake_usdc: float,
+) -> list[AgentWallet]:
+    """Obtain the agent pool — either REUSE an existing provisioned one or spawn
+    a fresh one and provision it on Arc.
+
+    Two mutually exclusive paths:
+
+      * REUSE (``reuse_keystores`` set): decrypt the encrypted keystores in that
+        dir back into wallets (each carrying its minted ``identity_id`` from the
+        ``identities.json`` sidecar) and return them AS-IS. NO ``spawn_keypairs``,
+        NO ``provision_agents`` — the agents are already minted/registered/staked,
+        so this spends ZERO USDC/gas and removes the provisioning gap. The keys
+        stay in memory; nothing is logged.
+
+      * FRESH (default): ``spawn_keypairs(agents)`` mints N encrypted keystores,
+        then ``provision_agents`` funds + self-mints identities + self-registers
+        each on Arc. The minted ``identity_id`` map is persisted via
+        ``save_identities`` so THIS pool can be reused later with
+        ``--reuse-keystores``.
+
+    Returns the list of ready-to-duel ``AgentWallet`` objects (each with a non-
+    ``None`` ``identity_id`` on success).
+    """
+    if reuse_keystores:
+        print(f"[1/4] reusing provisioned pool from {reuse_keystores} "
+              "(skip spawn + provision) ...")
+        wallets = load_agent_wallets(keystore_dir=reuse_keystores)
+        if not wallets:
+            raise SystemExit(
+                f"--reuse-keystores {reuse_keystores}: no *.keystore files found "
+                "there. Provision a pool first (run without --reuse-keystores)."
+            )
+        if len(wallets) < 2:
+            raise SystemExit(
+                f"--reuse-keystores {reuse_keystores}: need at least 2 agents to "
+                f"form a duel, found {len(wallets)}."
+            )
+        missing = [w.address for w in wallets if w.identity_id is None]
+        if missing:
+            raise SystemExit(
+                f"--reuse-keystores {reuse_keystores}: {len(missing)} keystore(s) "
+                "have no ERC-8004 identity_id in the identities.json sidecar — the "
+                "pool is not fully provisioned. Re-provision (run without "
+                "--reuse-keystores) or supply the sidecar."
+            )
+        print(f"[2/4] loaded {len(wallets)} pre-provisioned agents (no spend).")
+        return wallets
+
+    # Fresh path: spawn N keypairs, then provision them on Arc.
+    print(f"[1/4] spawning {agents} agent keypairs ...")
+    wallets = spawn_keypairs(agents)
+
+    print("[2/4] provisioning agents on Arc (fund + self-mint identity + register) ...")
+    wallets = provision_agents(
+        wallets,
+        rpc_url=rpc_url,
+        operator_pk=operator_pk,
+        colosseum=colosseum,
+        fund_usdc=fund_usdc,
+        stake_usdc=stake_usdc,
+    )
+    # Persist the minted address->identity_id map so this fresh pool can be
+    # REUSED later (--reuse-keystores) without re-spending USDC/gas.
+    try:
+        path = save_identities(wallets)
+        print(f"    saved identities sidecar -> {path} (pool now reusable)")
+    except OSError as exc:  # non-fatal: the run can still proceed this round
+        print(f"    warning: could not persist identities sidecar: {exc}")
+    return wallets
+
+
 def _format_rankings(result) -> str:
     """Render the Alpha + Iron Shield leaderboards as printable text."""
     lines: list[str] = []
@@ -197,6 +282,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--memory-anchor", required=True, help="Deployed MemoryAnchor address."
     )
     p.add_argument("--agents", type=int, default=4, help="Number of agents (default 4).")
+    p.add_argument(
+        "--reuse-keystores",
+        "--pool",
+        dest="reuse_keystores",
+        default=None,
+        metavar="DIR",
+        help="Reuse an ALREADY-provisioned agent pool: load encrypted keystores "
+        "from DIR (with their identities.json sidecar) and skip spawn + "
+        "provision entirely. The agents must already be minted/registered/staked "
+        "from a prior run. Saves USDC/gas and removes the provisioning gap.",
+    )
     p.add_argument("--cycles", type=int, default=4, help="Scored cycles per duel.")
     p.add_argument("--duration", type=int, default=45,
                    help="Trading-window seconds per duel (resolve waits it out). "
@@ -240,32 +336,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         raise SystemExit(
             "need an Arc RPC: pass --rpc-url or set $ARENA_RPC_URL / $RPC."
         )
-    if args.agents < 2:
+    # The fresh path needs --agents >= 2 to form a duel; the reuse path takes its
+    # count from the loaded pool (validated inside acquire_pool) and ignores --agents.
+    if not args.reuse_keystores and args.agents < 2:
         raise SystemExit("need at least 2 agents to form a duel (--agents >= 2).")
 
     print(f"================ The Arena — LIVE on Arc ================")
-    print(f"  agents    : {args.agents}")
+    print(f"  pool      : {'reuse ' + args.reuse_keystores if args.reuse_keystores else 'fresh spawn'}")
+    print(f"  agents    : {args.agents if not args.reuse_keystores else '(from pool)'}")
     print(f"  symbol    : {args.symbol} (scored on live Pyth)")
     print(f"  colosseum : {args.colosseum}")
     print(f"  anchor    : {args.memory_anchor}")
     print(f"  cycles    : {args.cycles}")
     print(f"========================================================")
 
-    # 1. Spawn N fresh agent keypairs (encrypted keystores; keys stay in memory).
-    print(f"[1/4] spawning {args.agents} agent keypairs ...")
-    wallets = spawn_keypairs(args.agents)
-
-    # 2. Provision each on Arc: operator funds, agent self-mints ERC-8004 identity,
-    #    agent approves + self-registers in the Colosseum.
-    print("[2/4] provisioning agents on Arc (fund + self-mint identity + register) ...")
-    wallets = provision_agents(
-        wallets,
-        rpc_url=args.rpc_url,
-        operator_pk=operator_pk,
-        colosseum=args.colosseum,
-        fund_usdc=args.fund_usdc,
-        stake_usdc=args.stake_usdc,
-    )
+    # 1+2. Acquire the agent pool: REUSE an already-provisioned one (skip spawn +
+    #      provision, zero spend) or spawn N fresh keypairs and provision them.
+    try:
+        wallets = acquire_pool(
+            reuse_keystores=args.reuse_keystores,
+            agents=args.agents,
+            rpc_url=args.rpc_url,
+            operator_pk=operator_pk,
+            colosseum=args.colosseum,
+            fund_usdc=args.fund_usdc,
+            stake_usdc=args.stake_usdc,
+        )
+    except AgentKeyError as exc:
+        raise SystemExit(f"could not load reused keystore pool: {exc}")
     for w in wallets:
         print(f"    agent {w.address}  identity_id={w.identity_id}")
 
