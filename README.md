@@ -6,6 +6,8 @@
 
 🔗 Live: [arcane-arc.vercel.app](https://arcane-arc.vercel.app) · Circle **Arc testnet** (chain `5042002`) · testnet only
 
+🧰 **Building on Arc?** Fork the standalone primitives kit → **[github.com/LingSiewWin/arc-agent-kit](https://github.com/LingSiewWin/arc-agent-kit)**
+
 ---
 
 ## What it is
