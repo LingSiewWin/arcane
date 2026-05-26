@@ -3,6 +3,7 @@
 import { Shield, Trophy } from "lucide-react";
 
 import { Card } from "@web/ui/components/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@web/ui/components/tabs";
 import {
   Table,
   TableBody,
@@ -16,7 +17,7 @@ import { COLOSSEUM_CONFIGURED, useArenaStandings, type ArenaStanding } from "@/l
 import { addressUrl } from "@/lib/chain";
 import { shortHash } from "@/lib/format";
 
-import { PanelTitle } from "@/components/panels/primitives";
+import { PanelTitle, StatusDot } from "@/components/panels/primitives";
 
 import { ArenaEmpty } from "./arena-empty";
 
@@ -45,8 +46,8 @@ function AddressLink({ address }: { address: string }) {
   );
 }
 
-/** A single ranking table (Alpha or Iron Shield) over the standings. */
-function RankingCard({
+/** One ranked table over the standings, highlighting the active metric. */
+function RankingTable({
   standings,
   metric,
 }: {
@@ -54,69 +55,90 @@ function RankingCard({
   metric: "alpha" | "shield";
 }) {
   return (
-    <Card className="p-0">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-12">#</TableHead>
-            <TableHead>Agent</TableHead>
-            <TableHead className="text-right">Alpha</TableHead>
-            <TableHead className="text-right">Iron Shield</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {standings.map((s, i) => (
-            <TableRow key={s.address}>
-              <TableCell className="font-mono text-muted-foreground">
-                {i === 0 ? (
-                  metric === "alpha" ? (
-                    <Trophy className="size-4 text-[--color-signal]" />
-                  ) : (
-                    <Shield className="size-4 text-[--color-signal]" />
-                  )
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-10">#</TableHead>
+          <TableHead>Agent</TableHead>
+          <TableHead className="text-right">Alpha</TableHead>
+          <TableHead className="text-right">Iron Shield</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {standings.map((s, i) => (
+          <TableRow key={s.address}>
+            <TableCell className="font-mono text-muted-foreground">
+              {i === 0 ? (
+                metric === "alpha" ? (
+                  <Trophy className="size-4 text-[--color-signal]" />
                 ) : (
-                  i + 1
-                )}
-              </TableCell>
-              <TableCell>
-                <AddressLink address={s.address} />
-              </TableCell>
-              <TableCell
-                className={`text-right font-mono text-xs tabular-nums ${
-                  s.alphaBps > 0
+                  <Shield className="size-4 text-[--color-signal]" />
+                )
+              ) : (
+                i + 1
+              )}
+            </TableCell>
+            <TableCell>
+              <AddressLink address={s.address} />
+            </TableCell>
+            <TableCell
+              className={`text-right font-mono text-xs tabular-nums ${
+                metric !== "alpha" ? "text-muted-foreground" : ""
+              } ${
+                metric === "alpha"
+                  ? s.alphaBps > 0
                     ? "text-[--color-ok]"
                     : s.alphaBps < 0
                       ? "text-[--color-alarm]"
                       : "text-muted-foreground"
-                }`}
-              >
-                {fmtAlpha(s.alphaBps)}
-              </TableCell>
-              <TableCell className="text-right font-mono text-xs tabular-nums">
-                {fmtResilience(s)}
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </Card>
+                  : ""
+              }`}
+            >
+              {fmtAlpha(s.alphaBps)}
+            </TableCell>
+            <TableCell
+              className={`text-right font-mono text-xs tabular-nums ${
+                metric === "shield" ? "" : "text-muted-foreground"
+              }`}
+            >
+              {fmtResilience(s)}
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   );
 }
 
+/**
+ * Standings — Alpha (cumulative PnL) and Iron Shield (manipulation resilience),
+ * both derived on-chain from CallReported + resilienceOf, collapsed into ONE
+ * compact tabbed card sized to sit beside Live activity. Same data, far less
+ * vertical space than the former two full-width tables.
+ */
 export function Leaderboard() {
   const standings = useArenaStandings();
 
+  const header = (
+    <div className="flex items-center justify-between">
+      <PanelTitle index="01" title="Standings" subtitle="alpha · iron shield" />
+      <span className="inline-flex items-center gap-1.5">
+        <StatusDot tone={COLOSSEUM_CONFIGURED ? "ok" : "idle"} label="on-chain" />
+        <span className="font-mono text-[10px] text-muted-foreground">CallReported</span>
+      </span>
+    </div>
+  );
+
   if (!COLOSSEUM_CONFIGURED) {
     return (
-      <section className="flex flex-col gap-4">
-        <PanelTitle index="03" title="Arena Standings" subtitle="colosseum not configured" />
+      <section className="flex h-full flex-col gap-3">
+        {header}
         <ArenaEmpty
           title="Colosseum not configured"
           cmd="NEXT_PUBLIC_COLOSSEUM=0x… in web/apps/web/.env.local"
         >
-          Standings are derived from Colosseum{" "}
-          <span className="font-mono">CallReported</span> events. Point the app at the Colosseum to
-          rank agents by Alpha (cumulative PnL) and Iron Shield (manipulation resilience).
+          Standings rank agents by Alpha (cumulative PnL) and Iron Shield (manipulation
+          resilience) from on-chain <span className="font-mono">CallReported</span> events.
         </ArenaEmpty>
       </section>
     );
@@ -126,11 +148,10 @@ export function Leaderboard() {
 
   if (data.length === 0) {
     return (
-      <section className="flex flex-col gap-4">
-        <PanelTitle index="03" title="Arena Standings" subtitle="alpha · iron shield" />
-        <ArenaEmpty title="No scored calls yet — start an arena">
-          No <span className="font-mono">CallReported</span> events on-chain yet. Agents enter the
-          standings the moment a duel scores their first trading call.
+      <section className="flex h-full flex-col gap-3">
+        {header}
+        <ArenaEmpty title="No scored calls yet">
+          Agents enter the standings the moment a duel scores their first trading call.
         </ArenaEmpty>
       </section>
     );
@@ -143,24 +164,26 @@ export function Leaderboard() {
   );
 
   return (
-    <section className="flex flex-col gap-6">
-      <div className="flex flex-col gap-4">
-        <PanelTitle
-          index="03"
-          title="Alpha"
-          subtitle="cumulative PnL — sum of scored calls (bps)"
-        />
-        <RankingCard standings={byAlpha} metric="alpha" />
-      </div>
-
-      <div className="flex flex-col gap-4">
-        <PanelTitle
-          index="04"
-          title="Iron Shield"
-          subtitle="manipulation resilience — injections survived / ingested"
-        />
-        <RankingCard standings={byShield} metric="shield" />
-      </div>
+    <section className="flex h-full flex-col gap-3">
+      {header}
+      <Card className="flex flex-1 flex-col gap-3 p-4">
+        <Tabs defaultValue="alpha" className="flex flex-1 flex-col gap-3">
+          <TabsList variant="line">
+            <TabsTrigger value="alpha">
+              <Trophy className="size-3.5" /> Alpha
+            </TabsTrigger>
+            <TabsTrigger value="shield">
+              <Shield className="size-3.5" /> Iron Shield
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="alpha">
+            <RankingTable standings={byAlpha} metric="alpha" />
+          </TabsContent>
+          <TabsContent value="shield">
+            <RankingTable standings={byShield} metric="shield" />
+          </TabsContent>
+        </Tabs>
+      </Card>
     </section>
   );
 }
